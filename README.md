@@ -50,10 +50,10 @@ You can verify the created entities in Home Assistant under **Developer Tools** 
 - `sensor.automower_supervisor_kv5` to `sensor.automower_supervisor_lv9` (one for each of the 11 robots).
   States:
   - `critical`: The robot has an active error, or a previously occurred error is now cleared but unverified (`cleared_but_unverified`).
-  - `warning`: No active error exists, but one or more central monitored entities are missing or unavailable.
-  - `insufficient_data`: Fewer than 2 central monitored entities are available.
-  - `ok`: No active errors, and all required entities are present and active.
-- `sensor.automower_supervisor_discovery` (overall integration health and discovered entities count).
+  - `warning`: No active error exists, but one or more central monitored entities are missing, unavailable, or `unknown` (while having at least 2 usable entities).
+  - `insufficient_data`: Fewer than 2 central monitored entities are available (neither missing, unavailable, nor `unknown`).
+  - `ok`: No active/unverified errors, and all required entities are present, available, and have active, known values.
+- `sensor.automower_supervisor_discovery` (overall integration health, counting discovered entities, missing, unavailable, and `unknown` metrics). Exposes the `entities_unknown` total attribute and includes the detailed status list under `robots`.
 
 ## Debug Logging
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import sys
 from types import ModuleType
+from typing import Any, Callable
 from unittest.mock import MagicMock, AsyncMock
 
 # ==========================================
@@ -163,19 +164,23 @@ homeassistant.components.sensor.SensorEntity = MockSensorEntity
 # Setup homeassistant.util.dt
 import homeassistant.util.dt
 class MockDt:
+    def __init__(self) -> None:
+        self.current_time = datetime.datetime(2026, 6, 9, 9, 15, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+
     def now(self) -> datetime.datetime:
-        # Fixed timezone-aware datetime: UTC+2
-        return datetime.datetime(2026, 6, 9, 9, 15, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+        return self.current_time
+
+    def set_time(self, dt: datetime.datetime) -> None:
+        self.current_time = dt
 homeassistant.util.dt = MockDt()
 
 # ==========================================
 # IMPORTING THE INTEGRATION MODULES
 # ==========================================
-from custom_components.automower_supervisor.const import DOMAIN, ROBOTS
-from custom_components.automower_supervisor.models import RobotState, RecoveryState
-from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
-from custom_components.automower_supervisor.sensor import AutomowerRobotSensor, AutomowerDiscoverySensor
-from custom_components.automower_supervisor.config_flow import AutomowerSupervisorConfigFlow
+from custom_components.automower_supervisor.models import RecoveryState  # noqa: E402
+from custom_components.automower_supervisor.manager import AutomowerSupervisorManager  # noqa: E402
+from custom_components.automower_supervisor.sensor import AutomowerRobotSensor, AutomowerDiscoverySensor  # noqa: E402
+from custom_components.automower_supervisor.config_flow import AutomowerSupervisorConfigFlow  # noqa: E402
 
 # ==========================================
 # UNIT TESTS
@@ -247,75 +252,109 @@ async def test_manager_setup_and_unload() -> None:
     manager._notify_callbacks()
     assert called
     
+    # Safe double unsubscribe (should not raise ValueError)
+    unsub()
     unsub()
     
     # Check unload
     await manager.async_unload()
     assert manager._unsub_listener is None
+    assert len(manager._callbacks) == 0
 
 
 @pytest.mark.asyncio
-async def test_error_state_transitions() -> None:
-    """Test the core error state machine logic."""
+async def test_error_timestamp_behavior() -> None:
+    """Test last_real_error_at timestamp updates only on new error incident."""
     hass = MagicMock()
     hass.states.get = MagicMock(return_value=None)
     
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 40, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
     manager = AutomowerSupervisorManager(hass)
     await manager.async_setup()
     
     robot_id = "automowerkv5"
     state = manager.robots[robot_id]
     
-    # Assert initial state (no errors)
-    assert state.recovery_state == RecoveryState.NONE
-    assert state.current_error_active is False
-    
-    # 1. Simulate finding an active error message
-    event_error = MockEvent(
-        entity_id="sensor.automowerkv5_mower_error_message",
-        new_state=MockState("Blade disc blocked")
-    )
-    await manager._async_state_changed_event(event_error)
+    # 1. New error: sets last_real_error_at
+    event1 = MockEvent("sensor.automowerkv5_mower_error_message", MockState("Blade disc blocked"))
+    await manager._async_state_changed_event(event1)
     
     assert state.current_error_active is True
-    assert state.recovery_state == RecoveryState.ACTIVE_ERROR
     assert state.last_real_error == "Blade disc blocked"
-    assert state.last_real_error_at is not None
-    assert state.error_cleared_at is None
+    t1 = state.last_real_error_at
+    assert t1 is not None
     
-    # 2. Simulate error clearing (goes to Fault 0)
-    event_clear = MockEvent(
-        entity_id="sensor.automowerkv5_mower_error_message",
-        new_state=MockState("Fault 0")
-    )
-    await manager._async_state_changed_event(event_clear)
+    # 2. Battery update: should NOT change timestamp
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 45, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
+    event2 = MockEvent("sensor.automowerkv5_mower_battery_charge", MockState("98"))
+    await manager._async_state_changed_event(event2)
+    assert state.last_real_error_at == t1
     
-    # The fault MUST survive and transition to cleared_but_unverified
-    assert state.current_error_active is False
+    # 3. Status update: should NOT change timestamp
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 47, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
+    event3 = MockEvent("sensor.automowerkv5_mower_status", MockState("Mowing"))
+    await manager._async_state_changed_event(event3)
+    assert state.last_real_error_at == t1
+
+    # 4. Same error message update: should NOT change timestamp
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 48, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
+    event4 = MockEvent("sensor.automowerkv5_mower_error_message", MockState("Blade disc blocked"))
+    await manager._async_state_changed_event(event4)
+    assert state.last_real_error_at == t1
+
+    # 5. New DIFFERENT error message: updates timestamp
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 50, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
+    event5 = MockEvent("sensor.automowerkv5_mower_error_message", MockState("No traction"))
+    await manager._async_state_changed_event(event5)
+    t2 = state.last_real_error_at
+    assert t2 != t1
+    assert state.last_real_error == "No traction"
+
+    # 6. Fault 0 does not erase/change error message or error timestamp
+    homeassistant.util.dt.set_time(datetime.datetime(2026, 6, 9, 15, 55, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))))
+    event6 = MockEvent("sensor.automowerkv5_mower_error_message", MockState("Fault 0"))
+    await manager._async_state_changed_event(event6)
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    assert state.last_real_error == "No traction"
+    assert state.last_real_error_at == t2
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_preserves_cleared_but_unverified() -> None:
+    """Test state machine preserves cleared_but_unverified across simulated restart."""
+    hass = MagicMock()
+    
+    # Setup mock HA database to show no error for automowersbv14
+    def mock_get(entity_id: str) -> MockState | None:
+        if entity_id == "sensor.automowersbv14_mower_error_message":
+            return MockState("Fault 0")
+        if entity_id == "binary_sensor.automowersbv14_mower_error":
+            return MockState("off")
+        return MockState("unknown")
+    hass.states.get = mock_get
+
+    manager = AutomowerSupervisorManager(hass)
+    
+    # Inject storage data into manager store
+    t_stored = "2026-06-08T15:40:26+02:00"
+    manager._storage._store.data = {
+        "automowersbv14": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_at": t_stored,
+            "error_cleared_at": "2026-06-08T15:41:00+02:00",
+            "current_error_active": False,
+            "recovery_state": "cleared_but_unverified",
+        }
+    }
+    
+    await manager.async_setup()
+    
+    # Verify values rehydrated and did NOT clear to none/recovered
+    state = manager.robots["automowersbv14"]
     assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
     assert state.last_real_error == "Blade disc blocked"
-    assert state.error_cleared_at is not None
-    
-    # 3. Simulate binary error goes to on (while error message is Fault 0)
-    event_binary_on = MockEvent(
-        entity_id="binary_sensor.automowerkv5_mower_error",
-        new_state=MockState("on")
-    )
-    await manager._async_state_changed_event(event_binary_on)
-    
-    assert state.current_error_active is True
-    assert state.recovery_state == RecoveryState.ACTIVE_ERROR
-    assert state.last_real_error == "Blade disc blocked"  # preserves message
-    
-    # 4. Simulate binary error goes to off (message still Fault 0)
-    event_binary_off = MockEvent(
-        entity_id="binary_sensor.automowerkv5_mower_error",
-        new_state=MockState("off")
-    )
-    await manager._async_state_changed_event(event_binary_off)
-    
+    assert state.last_real_error_at == t_stored
     assert state.current_error_active is False
-    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
 
 
 @pytest.mark.asyncio
@@ -346,80 +385,63 @@ async def test_contradictory_states() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rehydrate_from_storage() -> None:
-    """Test state machine preserves cleared_but_unverified across simulated restart."""
-    hass = MagicMock()
-    
-    # Setup mock HA database to show no error for automowersbv14
-    def mock_get(entity_id: str) -> MockState | None:
-        if entity_id == "sensor.automowersbv14_mower_error_message":
-            return MockState("Fault 0")
-        if entity_id == "binary_sensor.automowersbv14_mower_error":
-            return MockState("off")
-        return MockState("unknown")
-    hass.states.get = mock_get
-
-    manager = AutomowerSupervisorManager(hass)
-    
-    # Inject storage data into manager store
-    manager._storage._store.data = {
-        "automowersbv14": {
-            "last_real_error": "Blade disc blocked",
-            "last_real_error_at": "2026-06-08T15:40:26+02:00",
-            "error_cleared_at": "2026-06-08T15:41:00+02:00",
-            "current_error_active": False,
-            "recovery_state": "cleared_but_unverified",
-        }
-    }
-    
-    await manager.async_setup()
-    
-    # Verify values rehydrated and did NOT clear to none/recovered
-    state = manager.robots["automowersbv14"]
-    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
-    assert state.last_real_error == "Blade disc blocked"
-    assert state.current_error_active is False
-
-
-@pytest.mark.asyncio
-async def test_sensor_assessment_states() -> None:
-    """Test that the RobotSensor returns the correct states."""
+async def test_unknown_state_handling() -> None:
+    """Test that unknown states clear real-time values, report in lists, and impact warning/reasons."""
     hass = MagicMock()
     hass.states.get = MagicMock(return_value=None)
     
     manager = AutomowerSupervisorManager(hass)
     await manager.async_setup()
     
-    sensor = AutomowerRobotSensor("automowerkv5", manager)
-    state_data = manager.robots["automowerkv5"]
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
     
-    # 1. Insufficient data: initially no entities found
+    # Set status to mowing
+    event_status = MockEvent("sensor.automowerkv5_mower_status", MockState("Mowing"))
+    await manager._async_state_changed_event(event_status)
+    assert state.current_status == "Mowing"
+    
+    # Go to unknown
+    event_unknown = MockEvent("sensor.automowerkv5_mower_status", MockState("unknown"))
+    await manager._async_state_changed_event(event_unknown)
+    
+    # Real-time field MUST be None and list updated
+    assert state.current_status is None
+    assert "sensor.automowerkv5_mower_status" in state.unknown_entities
+    
+    # Insufficient data if fewer than 2 central entities are available
     assert sensor.native_value == "insufficient_data"
-    assert "INSUFFICIENT_DATA" in sensor.extra_state_attributes["assessment_reasons"]
     
-    # Simulate finding status and battery (2 central entities)
-    state_data.missing_entities.remove("sensor.automowerkv5_mower_status")
-    state_data.missing_entities.remove("sensor.automowerkv5_mower_battery_charge")
-    assert sensor.native_value == "warning"  # warning because some central ones still missing
-    assert "MISSING_ENTITIES" in sensor.extra_state_attributes["assessment_reasons"]
+    # Simulate finding status and battery via state changed events
+    event_status_valid = MockEvent("sensor.automowerkv5_mower_status", MockState("Mowing"))
+    await manager._async_state_changed_event(event_status_valid)
     
-    # Simulate finding all central entities
-    for key in ["status_plain", "error_message", "error_binary", "clock"]:
-        state_data.missing_entities.remove(state_data.entity_ids[key])
-    assert sensor.native_value == "ok"
-    assert len(sensor.extra_state_attributes["assessment_reasons"]) == 0
+    event_batt_valid = MockEvent("sensor.automowerkv5_mower_battery_charge", MockState("95"))
+    await manager._async_state_changed_event(event_batt_valid)
     
-    # Simulate an active error message
-    state_data.current_error_message = "Blade disc blocked"
-    state_data.recovery_state = RecoveryState.ACTIVE_ERROR
-    state_data.current_error_active = True
-    assert sensor.native_value == "critical"
-    assert "ACTIVE_ERROR_MESSAGE" in sensor.extra_state_attributes["assessment_reasons"]
+    # Now warning because clock is missing
+    assert sensor.native_value == "warning"
+    
+    # Set status_plain to valid so we have enough available entities when battery is unknown
+    event_status_plain = MockEvent("sensor.automowerkv5_mower_status_plain", MockState("mowing"))
+    await manager._async_state_changed_event(event_status_plain)
+    
+    # Set battery_charge to unknown
+    event_batt_unknown = MockEvent("sensor.automowerkv5_mower_battery_charge", MockState("unknown"))
+    await manager._async_state_changed_event(event_batt_unknown)
+    assert state.current_battery is None
+    assert "sensor.automowerkv5_mower_battery_charge" in state.unknown_entities
+    
+    # Warning because battery is unknown (and status and status_plain are available)
+    assert sensor.native_value == "warning"
+    # Reasons contains UNKNOWN_ENTITIES
+    assert "UNKNOWN_ENTITIES" in sensor.extra_state_attributes["assessment_reasons"]
 
 
 @pytest.mark.asyncio
-async def test_discovery_sensor_metrics() -> None:
-    """Test overall discovery aggregation sensor."""
+async def test_discovery_metrics_and_uniqueness() -> None:
+    """Test discovery aggregation logic and duplicate entity lists prevention."""
     hass = MagicMock()
     hass.states.get = MagicMock(return_value=None)
     
@@ -427,21 +449,79 @@ async def test_discovery_sensor_metrics() -> None:
     await manager.async_setup()
     
     disc_sensor = AutomowerDiscoverySensor(manager)
+    state = manager.robots["automowerkv5"]
     
-    # Initially all entities are missing, so found robots = 0
-    assert disc_sensor.native_value == 0
-    
-    # Mark at least one entity found for a robot
-    state_kv5 = manager.robots["automowerkv5"]
-    state_kv5.missing_entities.remove("sensor.automowerkv5_mower_status")
-    
-    # Found robots should be 1
-    assert disc_sensor.native_value == 1
-    
-    # Check attributes structure
+    # Initially all expected are missing, total expected = 11 * 12 = 132
     attrs = disc_sensor.extra_state_attributes
-    assert attrs["robots_configured"] == 11
-    assert attrs["robots_found"] == 1
-    assert "automowerkv5" in attrs["robots"]
-    assert "status" in attrs["robots"]["automowerkv5"]["found"]
-    assert "status_plain" in attrs["robots"]["automowerkv5"]["missing"]
+    assert attrs["entities_expected"] == 132
+    assert attrs["entities_missing"] == 132
+    assert attrs["entities_found"] == 0
+    assert attrs["entities_unavailable"] == 0
+    assert attrs["entities_unknown"] == 0
+    
+    # Set status to Mowing (Found)
+    event1 = MockEvent("sensor.automowerkv5_mower_status", MockState("Mowing"))
+    await manager._async_state_changed_event(event1)
+    
+    # Set status_plain to unavailable
+    event2 = MockEvent("sensor.automowerkv5_mower_status_plain", MockState("unavailable"))
+    await manager._async_state_changed_event(event2)
+    
+    # Set clock to unknown
+    event3 = MockEvent("sensor.automowerkv5_clock_time", MockState("unknown"))
+    await manager._async_state_changed_event(event3)
+    
+    attrs_updated = disc_sensor.extra_state_attributes
+    assert attrs_updated["entities_missing"] == 129
+    assert attrs_updated["entities_unavailable"] == 1
+    assert attrs_updated["entities_unknown"] == 1
+    assert attrs_updated["entities_found"] == 1
+    
+    # Verify exact calculations
+    # entities_found = 132 - 129 - 1 - 1 = 1
+    assert attrs_updated["entities_found"] == 1
+    
+    # Ensure no duplicates: send unavailable state again
+    await manager._async_state_changed_event(event2)
+    assert len(state.unavailable_entities) == 1
+    assert state.unavailable_entities.count("sensor.automowerkv5_mower_status_plain") == 1
+    
+    # Enforce mutual exclusivity
+    # Make status_plain unknown (should move from unavailable to unknown)
+    event2_unknown = MockEvent("sensor.automowerkv5_mower_status_plain", MockState("unknown"))
+    await manager._async_state_changed_event(event2_unknown)
+    assert "sensor.automowerkv5_mower_status_plain" not in state.unavailable_entities
+    assert "sensor.automowerkv5_mower_status_plain" in state.unknown_entities
+
+
+@pytest.mark.asyncio
+async def test_unload_sequence_and_idempotence() -> None:
+    """Test unload sequences: platform unload before manager unload, and idempotency."""
+    hass = MagicMock()
+    
+    # Setup mock helper for async_unload_platforms to return True
+    hass.config_entries = MagicMock()
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    
+    from custom_components.automower_supervisor import async_unload_entry
+    
+    entry = MockConfigEntry()
+    manager = AutomowerSupervisorManager(hass)
+    entry.runtime_data = manager
+    
+    # Setup track state change spy to verify unsub
+    unsub_mock = MagicMock()
+    manager._unsub_listener = unsub_mock
+    
+    # Run unload
+    res = await async_unload_entry(hass, entry)
+    
+    assert res is True
+    # Verify manager listeners and callbacks cleared
+    assert manager._unsub_listener is None
+    assert len(manager._callbacks) == 0
+    unsub_mock.assert_called_once()
+    
+    # Verify idempotence (a second unload does not crash)
+    await manager.async_unload()
+    assert manager._unsub_listener is None

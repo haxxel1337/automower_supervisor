@@ -94,14 +94,18 @@ class AutomowerRobotSensor(SensorEntity):
             state_data.entity_ids[k] for k in central_keys
             if state_data.entity_ids[k] in state_data.unavailable_entities
         ]
+        unknown_centrals = [
+            state_data.entity_ids[k] for k in central_keys
+            if state_data.entity_ids[k] in state_data.unknown_entities
+        ]
 
-        # Insufficient data if fewer than 2 central entities are available
-        available_count = len(central_keys) - len(missing_centrals) - len(unavailable_centrals)
+        # Insufficient data if fewer than 2 central entities are available (with useful values)
+        available_count = len(central_keys) - len(missing_centrals) - len(unavailable_centrals) - len(unknown_centrals)
         if available_count < 2:
             return "insufficient_data"
 
-        # Warning state if any central entity is missing or unavailable
-        if missing_centrals or unavailable_centrals:
+        # Warning state if any central entity is missing, unavailable or unknown
+        if missing_centrals or unavailable_centrals or unknown_centrals:
             return "warning"
 
         return "ok"
@@ -126,7 +130,6 @@ class AutomowerRobotSensor(SensorEntity):
             reasons.append("BINARY_ERROR_ON")
         if state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
             reasons.append("CLEARED_BUT_UNVERIFIED")
-
         central_keys = ["status", "status_plain", "battery", "error_message", "error_binary", "clock"]
         missing_centrals = [
             state_data.entity_ids[k] for k in central_keys
@@ -136,13 +139,19 @@ class AutomowerRobotSensor(SensorEntity):
             state_data.entity_ids[k] for k in central_keys
             if state_data.entity_ids[k] in state_data.unavailable_entities
         ]
+        unknown_centrals = [
+            state_data.entity_ids[k] for k in central_keys
+            if state_data.entity_ids[k] in state_data.unknown_entities
+        ]
 
         if missing_centrals:
             reasons.append("MISSING_ENTITIES")
         if unavailable_centrals:
             reasons.append("UNAVAILABLE_ENTITIES")
+        if unknown_centrals:
+            reasons.append("UNKNOWN_ENTITIES")
 
-        available_count = len(central_keys) - len(missing_centrals) - len(unavailable_centrals)
+        available_count = len(central_keys) - len(missing_centrals) - len(unavailable_centrals) - len(unknown_centrals)
         if available_count < 2:
             reasons.append("INSUFFICIENT_DATA")
 
@@ -205,16 +214,18 @@ class AutomowerDiscoverySensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return diagnostic metrics about expected vs missing vs unavailable entities."""
+        """Return diagnostic metrics about expected vs missing vs unavailable vs unknown entities."""
         robots_dict = {}
         total_expected = 0
         total_missing = 0
         total_unavailable = 0
+        total_unknown = 0
 
         for robot_id, state_data in self.manager.robots.items():
             found_keys = []
             missing_keys = []
             unavailable_keys = []
+            unknown_keys = []
 
             for key, entity_id in state_data.entity_ids.items():
                 total_expected += 1
@@ -224,6 +235,9 @@ class AutomowerDiscoverySensor(SensorEntity):
                 elif entity_id in state_data.unavailable_entities:
                     unavailable_keys.append(key)
                     total_unavailable += 1
+                elif entity_id in state_data.unknown_entities:
+                    unknown_keys.append(key)
+                    total_unknown += 1
                 else:
                     found_keys.append(key)
 
@@ -232,9 +246,10 @@ class AutomowerDiscoverySensor(SensorEntity):
                 "found": found_keys,
                 "missing": missing_keys,
                 "unavailable": unavailable_keys,
+                "unknown": unknown_keys,
             }
 
-        total_found = total_expected - total_missing
+        total_found = total_expected - total_missing - total_unavailable - total_unknown
 
         return {
             "robots_configured": len(self.manager.robots),
@@ -243,5 +258,6 @@ class AutomowerDiscoverySensor(SensorEntity):
             "entities_found": total_found,
             "entities_missing": total_missing,
             "entities_unavailable": total_unavailable,
+            "entities_unknown": total_unknown,
             "robots": robots_dict,
         }

@@ -42,6 +42,19 @@ def safe_int(val: Any) -> int | None:
         return None
 
 
+def _update_entity_state_lists(state: RobotState, entity_id: str, target_list_name: str | None) -> None:
+    """Ensure entity_id is mutually exclusive and present in at most one list without duplicates."""
+    for lst in (state.missing_entities, state.unavailable_entities, state.unknown_entities):
+        if entity_id in lst:
+            lst.remove(entity_id)
+    if target_list_name == "missing":
+        state.missing_entities.append(entity_id)
+    elif target_list_name == "unavailable":
+        state.unavailable_entities.append(entity_id)
+    elif target_list_name == "unknown":
+        state.unknown_entities.append(entity_id)
+
+
 class AutomowerSupervisorManager:
     """Manages tracking and evaluating the state of all configured Automowers."""
 
@@ -135,12 +148,15 @@ class AutomowerSupervisorManager:
                 ha_state = self.hass.states.get(entity_id)
                 
                 if ha_state is None:
-                    state.missing_entities.append(entity_id)
+                    _update_entity_state_lists(state, entity_id, "missing")
                 elif ha_state.state == "unavailable":
-                    state.unavailable_entities.append(entity_id)
+                    _update_entity_state_lists(state, entity_id, "unavailable")
+                    self._update_state_field(state, key, None)
                 elif ha_state.state == "unknown":
-                    state.unknown_entities.append(entity_id)
+                    _update_entity_state_lists(state, entity_id, "unknown")
+                    self._update_state_field(state, key, None)
                 else:
+                    _update_entity_state_lists(state, entity_id, None)
                     self._update_state_field(state, key, ha_state.state)
                     
             # Evaluate error state after initial loading
@@ -177,25 +193,18 @@ class AutomowerSupervisorManager:
         current_time_iso = dt_util.now().isoformat()
         state.last_event_at = current_time_iso
         
-        # Remove entity from states tracking
-        if entity_id in state.missing_entities:
-            state.missing_entities.remove(entity_id)
-        if entity_id in state.unavailable_entities:
-            state.unavailable_entities.remove(entity_id)
-        if entity_id in state.unknown_entities:
-            state.unknown_entities.remove(entity_id)
-            
         # Update lists and state values
         if new_state is None:
-            state.missing_entities.append(entity_id)
+            _update_entity_state_lists(state, entity_id, "missing")
             self._update_state_field(state, key, None)
         elif new_state.state == "unavailable":
-            state.unavailable_entities.append(entity_id)
+            _update_entity_state_lists(state, entity_id, "unavailable")
             self._update_state_field(state, key, None)
         elif new_state.state == "unknown":
-            state.unknown_entities.append(entity_id)
+            _update_entity_state_lists(state, entity_id, "unknown")
             self._update_state_field(state, key, None)
         else:
+            _update_entity_state_lists(state, entity_id, None)
             self._update_state_field(state, key, new_state.state)
             
         # Re-evaluate logic for errors
@@ -224,6 +233,7 @@ class AutomowerSupervisorManager:
     def _update_robot_error_state(self, robot_id: str, current_time_iso: str) -> bool:
         """Evaluate the robot error state machine. Returns True if storage fields changed."""
         state = self.robots[robot_id]
+        was_error_active = state.current_error_active
         
         # Normalise error message
         is_real_error = False
@@ -249,10 +259,9 @@ class AutomowerSupervisorManager:
                 changed = True
                 
             if is_real_error:
-                if state.last_real_error != state.current_error_message:
+                # Update timestamp ONLY if we are transitioning to active or the error text changed
+                if not was_error_active or state.last_real_error != state.current_error_message:
                     state.last_real_error = state.current_error_message
-                    changed = True
-                if state.last_real_error_at != current_time_iso:
                     state.last_real_error_at = current_time_iso
                     changed = True
         else:
@@ -272,12 +281,18 @@ class AutomowerSupervisorManager:
 
     def async_register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback for update notifications."""
-        self._callbacks.append(callback)
-        return lambda: self._callbacks.remove(callback)
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+            
+        def _unsubscribe() -> None:
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+                
+        return _unsubscribe
 
     def _notify_callbacks(self) -> None:
         """Notify all registered sensor callbacks."""
-        for callback in self._callbacks:
+        for callback in list(self._callbacks):
             try:
                 callback()
             except Exception as err:
@@ -287,8 +302,14 @@ class AutomowerSupervisorManager:
         """Unload entry, clear listeners and save immediately."""
         _LOGGER.debug("Unloading Automower Supervisor manager")
         if self._unsub_listener:
-            self._unsub_listener()
+            try:
+                self._unsub_listener()
+            except Exception as err:
+                _LOGGER.error("Error unsubscribing state listener: %s", err)
             self._unsub_listener = None
+            
+        # Clear callbacks
+        self._callbacks.clear()
             
         # Write storage synchronously/immediately before unload completes
         await self._storage.async_save(self.get_storage_data())

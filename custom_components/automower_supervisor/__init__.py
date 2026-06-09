@@ -39,11 +39,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[AutomowerSu
     """Unload Automower Supervisor config entry."""
     _LOGGER.info("Unloading Automower Supervisor entry: %s", entry.entry_id)
 
-    # Clean up listeners and persist current state
-    manager = entry.runtime_data
-    await manager.async_unload()
-
     # Unload sensor platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    if unload_ok:
+        # Clean up listeners and persist current state
+        manager = entry.runtime_data
+        await manager.async_unload()
 
     return unload_ok
