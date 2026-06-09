@@ -149,6 +149,7 @@ class AutomowerSupervisorManager:
                 
                 if ha_state is None:
                     _update_entity_state_lists(state, entity_id, "missing")
+                    self._update_state_field(state, key, None)
                 elif ha_state.state == "unavailable":
                     _update_entity_state_lists(state, entity_id, "unavailable")
                     self._update_state_field(state, key, None)
@@ -212,7 +213,7 @@ class AutomowerSupervisorManager:
         
         if storage_changed:
             _LOGGER.debug("Error state changed for %s, saving to storage", robot_id)
-            self._storage.async_delay_save(self.get_storage_data(), 10.0)
+            self._storage.async_delay_save(self.get_storage_data, 10.0)
             
         # Notify registered UI sensors
         self._notify_callbacks()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -37,9 +38,16 @@ class AutomowerSupervisorStorage:
         except Exception as err:
             _LOGGER.error("Failed to save Automower Supervisor persistent storage: %s", err)
 
-    def async_delay_save(self, data: dict[str, Any], delay: float = 10.0) -> None:
-        """Delay saving to storage to minimize disk writes."""
+    def async_delay_save(
+        self,
+        data_callback: Callable[[], dict[str, Any]],
+        delay: float = 10.0,
+    ) -> None:
+        """Delay saving to storage and resolve the latest data at write time."""
         try:
-            self._store.async_delay_save(lambda: data, delay)
+            self._store.async_delay_save(data_callback, delay)
         except Exception as err:
-            _LOGGER.error("Failed to schedule delayed save for Automower Supervisor: %s", err)
+            _LOGGER.error(
+                "Failed to schedule delayed save for Automower Supervisor: %s",
+                err,
+            )

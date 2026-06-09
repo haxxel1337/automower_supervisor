@@ -525,3 +525,74 @@ async def test_unload_sequence_and_idempotence() -> None:
     # Verify idempotence (a second unload does not crash)
     await manager.async_unload()
     assert manager._unsub_listener is None
+
+
+@pytest.mark.asyncio
+async def test_sync_initial_states_missing_reset() -> None:
+    """Test that missing entities (None state) during sync_initial_states resets values to None."""
+    hass = MagicMock()
+    
+    # 1. Initially, entity exists and has a value
+    states_db = {
+        "sensor.automowerkv5_mower_battery_charge": MockState("75")
+    }
+    
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+        
+    hass.states.get = mock_get
+    
+    manager = AutomowerSupervisorManager(hass)
+    manager.sync_initial_states()
+    
+    # Verify current_battery is 75
+    state = manager.robots["automowerkv5"]
+    assert state.current_battery == 75
+    assert "sensor.automowerkv5_mower_battery_charge" not in state.missing_entities
+    
+    # 2. Entity is removed (states.get returns None) and sync_initial_states is run again
+    states_db.clear()
+    manager.sync_initial_states()
+    
+    # Verify current_battery is None and it is tracked in missing_entities
+    assert state.current_battery is None
+    assert "sensor.automowerkv5_mower_battery_charge" in state.missing_entities
+
+
+@pytest.mark.asyncio
+async def test_delayed_save_latest_data() -> None:
+    """Test that delayed save uses the latest data from the manager at the time of execution."""
+    hass = MagicMock()
+    hass.states.get = MagicMock(return_value=None)
+    
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    
+    # Initial state
+    state.last_real_error = "Blade disc blocked"
+    
+    captured_callback = None
+    def mock_async_delay_save(callback: Callable[[], dict[str, Any]], delay: float) -> None:
+        nonlocal captured_callback
+        captured_callback = callback
+        
+    # Override store's async_delay_save to capture callback instead of executing immediately
+    manager._storage._store.async_delay_save = mock_async_delay_save
+    
+    # Trigger change
+    event = MockEvent("sensor.automowerkv5_mower_error_message", MockState("No traction"))
+    await manager._async_state_changed_event(event)
+    
+    assert captured_callback is not None
+    
+    # Modify data BEFORE the callback is executed (simulating delay)
+    state.last_real_error = "No traction"
+    
+    # Execute callback (simulating write time)
+    resolved_data = captured_callback()
+    
+    assert resolved_data[robot_id]["last_real_error"] == "No traction"
+
