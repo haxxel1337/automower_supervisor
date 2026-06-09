@@ -181,6 +181,11 @@ class MockDt:
 
     def set_time(self, dt: datetime.datetime) -> None:
         self.current_time = dt
+
+    def as_utc(self, dt: datetime.datetime) -> datetime.datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
 homeassistant.util.dt = MockDt()
 
 # ==========================================
@@ -867,6 +872,104 @@ async def test_setup_optimizations() -> None:
     assert len(hass._mock_time_callbacks) == 2
     assert hass._mock_time_callbacks[0][1] == datetime.timedelta(minutes=5)
     assert hass._mock_time_callbacks[1][1] == datetime.timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_timezone_calculations() -> None:
+    """Test watchdog handles timezone difference calculations correctly."""
+    hass = MagicMock()
+    
+    # Mocking states in HA
+    states_db = {}
+    def mock_get(entity_id: str) -> Any:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+    
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    
+    # 1. now in Europe/Stockholm (UTC+2) and last_updated in UTC with same physical time:
+    # 13:00:40+02:00 vs 11:00:40+00:00 (difference should be 0 minutes)
+    now = datetime.datetime(2026, 6, 9, 13, 0, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    last_updated = datetime.datetime(2026, 6, 9, 11, 0, 40, tzinfo=datetime.timezone.utc)
+    
+    states_db[state.entity_ids["clock"]] = MockState("11:00", last_updated=last_updated)
+    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=last_updated)
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=last_updated)
+    states_db[state.entity_ids["battery"]] = MockState("80", last_updated=last_updated)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=last_updated)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=last_updated)
+    
+    await manager._async_watchdog_check(now)
+    
+    assert state.online is True
+    assert state.source_age_minutes == 0
+    assert sensor.native_value == "ok"
+    assert sensor.extra_state_attributes["online"] is True
+    assert sensor.extra_state_attributes["source_values_stale"] is False
+    
+    # 2. UTC and local timezone with 5 minutes of physical difference:
+    # now = 13:05:40+02:00, last_updated = 11:00:40+00:00 -> 5 minutes difference
+    now_5 = datetime.datetime(2026, 6, 9, 13, 5, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    await manager._async_watchdog_check(now_5)
+    assert state.online is True
+    assert state.source_age_minutes == 5
+    
+    # 3. 20 minutes physical difference -> stale/warning
+    # now = 13:20:40+02:00, last_updated = 11:00:40+00:00 -> 20 minutes difference
+    now_20 = datetime.datetime(2026, 6, 9, 13, 20, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    await manager._async_watchdog_check(now_20)
+    assert state.online is True
+    assert state.source_age_minutes == 20
+    assert sensor.native_value == "warning"
+    assert sensor.extra_state_attributes["source_values_stale"] is True
+    assert "STALE_SOURCE_DATA" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 4. 61 minutes physical difference -> offline/critical
+    # now = 14:01:40+02:00, last_updated = 11:00:40+00:00 -> 61 minutes difference
+    now_61 = datetime.datetime(2026, 6, 9, 14, 1, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    await manager._async_watchdog_check(now_61)
+    assert state.online is False
+    assert state.source_age_minutes == 61
+    assert sensor.native_value == "critical"
+    assert sensor.extra_state_attributes["source_values_stale"] is True
+    assert "ROBOT_OFFLINE" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 5. Individual stale entities age is calculated based on timezone-aware differences:
+    # Update clock to be fresh (13:01:40+02:00, which is 11:01:40+00:00, so age = 0 when now = 13:01:40+02:00)
+    # But status_plain is still 11:00:40+00:00 (20 minutes older -> should be in stale_entities)
+    now_stale = datetime.datetime(2026, 6, 9, 13, 20, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    states_db[state.entity_ids["clock"]] = MockState("11:20", last_updated=datetime.datetime(2026, 6, 9, 11, 20, 40, tzinfo=datetime.timezone.utc))
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=datetime.datetime(2026, 6, 9, 11, 0, 40, tzinfo=datetime.timezone.utc))
+    
+    await manager._async_watchdog_check(now_stale)
+    assert state.source_age_minutes == 0 # latest update (clock) is fresh (age 0)
+    assert state.online is True
+    # status_plain has age 20 minutes (2026-06-09 11:00:40+00:00 vs now 13:20:40+02:00) -> should be stale
+    assert state.entity_ids["status_plain"] in state.stale_entities
+    
+    # 6. Previously seen heartbeat timestamp from ISO string parsed and converted properly:
+    # Clear states_db so useful_heartbeats is empty, simulating unavailable state.
+    # Set state.last_heartbeat_seen_at to "2026-06-09T11:00:40+00:00"
+    for key in ["clock", "status", "status_plain", "battery", "error_message", "error_binary"]:
+        states_db[state.entity_ids[key]] = MockState("unavailable", last_updated=datetime.datetime.now())
+        
+    state.last_heartbeat_seen_at = "2026-06-09T11:00:40+00:00"
+    # now = 13:20:40+02:00 -> difference is 20 minutes
+    now_seen = datetime.datetime(2026, 6, 9, 13, 20, 40, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    await manager._async_watchdog_check(now_seen)
+    assert state.online is True
+    assert state.source_age_minutes == 20
+    
+    # 7. Check manager.py using regex to verify no replace(tzinfo=None) remains in the watchdog code
+    with open("custom_components/automower_supervisor/manager.py", "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "replace(tzinfo=None)" not in content
+
 
 
 

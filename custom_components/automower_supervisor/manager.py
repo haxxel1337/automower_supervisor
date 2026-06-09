@@ -385,10 +385,10 @@ class AutomowerSupervisorManager:
             state.last_source_update_at = latest_dt.isoformat()
             state.last_heartbeat_seen_at = latest_dt.isoformat()
             
-            now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
-            latest_dt_naive = latest_dt.replace(tzinfo=None) if latest_dt.tzinfo is not None else latest_dt
+            now_utc = dt_util.as_utc(now)
+            latest_utc = dt_util.as_utc(latest_dt)
             
-            age_delta = now_naive - latest_dt_naive
+            age_delta = now_utc - latest_utc
             age_min = max(0, int(age_delta.total_seconds() / 60))
             state.source_age_minutes = age_min
             
@@ -402,9 +402,9 @@ class AutomowerSupervisorManager:
                 
             # Check for individual stale entities (age > 15 minutes)
             for entity_id, ha_state in useful_heartbeats:
-                ha_updated = ha_state.last_updated
-                ha_updated_naive = ha_updated.replace(tzinfo=None) if ha_updated.tzinfo is not None else ha_updated
-                entity_age = (now_naive - ha_updated_naive).total_seconds() / 60
+                entity_age = (
+                    dt_util.as_utc(now) - dt_util.as_utc(ha_state.last_updated)
+                ).total_seconds() / 60
                 if entity_age > 15:
                     state.stale_entities.append(entity_id)
         else:
@@ -413,10 +413,10 @@ class AutomowerSupervisorManager:
                 # Use the previously seen heartbeat time
                 seen_dt = datetime.fromisoformat(state.last_heartbeat_seen_at)
                 
-                now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
-                seen_dt_naive = seen_dt.replace(tzinfo=None) if seen_dt.tzinfo is not None else seen_dt
+                now_utc = dt_util.as_utc(now)
+                seen_utc = dt_util.as_utc(seen_dt)
                 
-                age_delta = now_naive - seen_dt_naive
+                age_delta = now_utc - seen_utc
                 age_min = max(0, int(age_delta.total_seconds() / 60))
                 state.source_age_minutes = age_min
                 
