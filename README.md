@@ -1,40 +1,32 @@
-# Automower Supervisor v0.2.3
+# Automower Supervisor v0.3.0
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
 
-## Features in version 0.2
+## Features in version 0.3
 
+- **Mowing Session Tracking**: Registers cohesive mowing sessions. Distinguishes short startup attempts (faktiska klippförsök < 3 min) from real mowing, and handles short status interruptions (e.g., `Searching` or `Detecting status`) up to 10 minutes without breaking the session.
+- **Mowing Confirmation & Grace Period**: Evaluates session validity upon termination. Sessions of >= 10 minutes require supporting data (battery drop >= 2, distance delta >= 1.0, or runtime hours delta >= 0.01) to enter a 5-minute confirmation grace period. After 5 minutes without new errors, it is classified as `confirmed_mowing`.
+- **Verified Recovery Logic**: Automated verification to recover from previous errors:
+  - *Movement errors* (e.g. "No traction") transition from `cleared_but_unverified` to `recovered` immediately upon a distance increase of >= 1.0.
+  - *Cutting / other errors* (e.g. "Blade disc blocked") transition to `recovered` after a confirmed mowing session has completed.
+- **Stockholm Timezone Schedule Support**: Monitored robots follow a fixed daily schedule (Monday-Sunday 11:00-18:00 Europe/Stockholm). If the schedule is active, warnings are generated if mowing is active but not yet confirmed today, or if a mowing attempt was made but has not yet been confirmed today.
 - **Local Event Monitoring**: Listens to existing robotic lawn mower entities directly in Home Assistant without external polling. Push-based updates are processed in real-time.
-- **Periodic Watchdog Check**: A background watchdog runs every 5 minutes (using Home Assistant's `async_track_time_interval`) to check the age of the entity states and detect frozen or stale data without polling any external API or Robonect device.
+- **Periodic Watchdog Check**: A background watchdog runs every 5 minutes to check state age and frozen data.
 - **Offline and Stale Data Detection with Grace Period**:
   - `online` is marked `true` when at least one heartbeat entity has updated within 15 minutes.
-  - If heartbeat entities go `unavailable` or `unknown` temporarily, the watchdog uses a grace period (retaining the online state for up to 60 minutes based on the last observed heartbeat timestamp `last_heartbeat_seen_at`) rather than classifying them offline immediately.
+  - If heartbeat entities go `unavailable` or `unknown` temporarily, the watchdog uses a grace period (retaining the online state for up to 60 minutes based on `last_heartbeat_seen_at`) rather than classifying them offline immediately.
   - `online` is marked `false` when no heartbeat updates have been seen for more than 60 minutes.
-  - If a robot is offline, its state becomes `critical` with reason code `ROBOT_OFFLINE` (and the `source_values_stale` attribute is set to `true`).
-  - If updates are older than 15 minutes but <= 60 minutes, the state is `warning` with reason code `STALE_SOURCE_DATA`.
 - **Persistent Error Log**: Real errors are captured and written to local storage using Home Assistant's Store helper.
-- **Fault Retention**: An error is marked as `cleared_but_unverified` when the mower reports `Fault 0` or goes `off`. It remains in a `critical` assessment state until a future version adds automated verification.
-- **Config Flow Setup**: Setup is easily initiated via the Home Assistant UI (Settings -> Devices & Services).
-- **11 Robots Monitored**: Monitored robot IDs:
-  - `automowerkv5` (Kv5)
-  - `automowertuv4` (Tuv4)
-  - `automowervv14mini` (Vv14 Mini)
-  - `automowervv14big` (Vv14 Big)
-  - `automowervv18` (Vv18)
-  - `automoweralmv3` (Almv3)
-  - `automowerbd17` (Bd17)
-  - `automowersbv14` (Sbv14)
-  - `automowervv2` (Vv2)
-  - `automowertrv4` (Trv4)
-  - `automowerlv9` (Lv9)
-- **Central Discovery Sensor**: A summary sensor (`sensor.automower_supervisor_discovery`) details the overall integration status and the configuration of expected vs missing/unavailable entities.
+- **Fault Retention**: An error is marked as `cleared_but_unverified` when the mower reports `Fault 0` or goes `off`. It remains in a `critical` assessment state until verified.
+- **Config Flow Setup**: Setup is easily initiated via the Home Assistant UI.
+- **11 Robots Monitored**: Monitored robot IDs include Almv3, Kv5, Tuv4, etc.
 
-## What is NOT included in version 0.2
+## What is NOT included in version 0.3
 
 - No external API/MQTT/REST client connection.
 - No Google Calendar integration.
-- No automated verification of recovered lawn mowers (transitioning to `recovered`).
-- No analysis of battery trends, mowing statistics, or distance.
+- No direct polling of the Robonect device.
+- No REST APIs or LLM parsing.
 
 ## Installation
 

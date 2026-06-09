@@ -186,6 +186,19 @@ class MockDt:
         if dt.tzinfo is None:
             return dt.replace(tzinfo=datetime.timezone.utc)
         return dt.astimezone(datetime.timezone.utc)
+
+    def get_time_zone(self, tz_name: str) -> datetime.tzinfo | None:
+        import zoneinfo
+        try:
+            return zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            return datetime.timezone(datetime.timedelta(hours=2))
+
+    def as_local(self, dt: datetime.datetime) -> datetime.datetime:
+        tz = self.get_time_zone("Europe/Stockholm")
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
 homeassistant.util.dt = MockDt()
 
 # ==========================================
@@ -205,7 +218,7 @@ import pytest
 class MockState:
     def __init__(self, state_value: str, last_updated: datetime.datetime | None = None) -> None:
         self.state = state_value
-        self.last_updated = last_updated or datetime.datetime.now()
+        self.last_updated = last_updated or homeassistant.util.dt.now()
 
 class MockEvent:
     def __init__(self, entity_id: str, new_state: MockState | None, old_state: MockState | None = None) -> None:
@@ -776,10 +789,10 @@ async def test_setup_optimizations() -> None:
     
     sync_calls = 0
     original_sync = manager.sync_initial_states
-    def spy_sync() -> bool:
+    def spy_sync(*args, **kwargs) -> bool:
         nonlocal sync_calls
         sync_calls += 1
-        return original_sync()
+        return original_sync(*args, **kwargs)
     manager.sync_initial_states = spy_sync
     
     save_calls = 0
@@ -817,18 +830,18 @@ async def test_setup_optimizations() -> None:
             return MockState("off")
         # Provide clock and battery to calculate watchdog metrics
         if "clock" in entity_id:
-            return MockState("12:00", last_updated=datetime.datetime.now())
+            return MockState("12:00", last_updated=homeassistant.util.dt.now())
         if "battery" in entity_id:
-            return MockState("90", last_updated=datetime.datetime.now())
+            return MockState("90", last_updated=homeassistant.util.dt.now())
         return None
     hass.states.get = mock_get
     
     sync_calls2 = 0
     original_sync2 = manager2.sync_initial_states
-    def spy_sync2() -> bool:
+    def spy_sync2(*args, **kwargs) -> bool:
         nonlocal sync_calls2
         sync_calls2 += 1
-        return original_sync2()
+        return original_sync2(*args, **kwargs)
     manager2.sync_initial_states = spy_sync2
     
     save_calls2 = 0
@@ -849,10 +862,10 @@ async def test_setup_optimizations() -> None:
     
     # 3. Test periodic watchdog check still runs full sync and calls callbacks
     sync_calls_watchdog = 0
-    def spy_sync_watchdog() -> bool:
+    def spy_sync_watchdog(*args, **kwargs) -> bool:
         nonlocal sync_calls_watchdog
         sync_calls_watchdog += 1
-        return original_sync2()
+        return original_sync2(*args, **kwargs)
     manager2.sync_initial_states = spy_sync_watchdog
     
     cb_called = False
@@ -861,7 +874,7 @@ async def test_setup_optimizations() -> None:
         cb_called = True
     manager2.async_register_callback(test_cb)
     
-    await manager2._async_watchdog_check(datetime.datetime.now())
+    await manager2._async_watchdog_check(homeassistant.util.dt.now())
     # sync_initial_states is called again during watchdog run
     assert sync_calls_watchdog == 1
     # Callback notified
@@ -956,7 +969,7 @@ async def test_watchdog_timezone_calculations() -> None:
     # Clear states_db so useful_heartbeats is empty, simulating unavailable state.
     # Set state.last_heartbeat_seen_at to "2026-06-09T11:00:40+00:00"
     for key in ["clock", "status", "status_plain", "battery", "error_message", "error_binary"]:
-        states_db[state.entity_ids[key]] = MockState("unavailable", last_updated=datetime.datetime.now())
+        states_db[state.entity_ids[key]] = MockState("unavailable", last_updated=homeassistant.util.dt.now())
         
     state.last_heartbeat_seen_at = "2026-06-09T11:00:40+00:00"
     # now = 13:20:40+02:00 -> difference is 20 minutes
@@ -966,9 +979,587 @@ async def test_watchdog_timezone_calculations() -> None:
     assert state.source_age_minutes == 20
     
     # 7. Check manager.py using regex to verify no replace(tzinfo=None) remains in the watchdog code
-    with open("custom_components/automower_supervisor/manager.py", "r", encoding="utf-8") as f:
+    import os
+    manager_path = os.path.join(os.path.dirname(__file__), "../custom_components/automower_supervisor/manager.py")
+    with open(manager_path, "r", encoding="utf-8") as f:
         content = f.read()
     assert "replace(tzinfo=None)" not in content
+
+
+@pytest.mark.asyncio
+async def test_version_0_3_0_scenarios() -> None:
+    """Comprehensive tests for version 0.3.0 requirements."""
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    states_db = {}
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    
+    # Base timestamp: 2026-06-09 12:00:00 UTC (14:00:00 Stockholm, which is within the schedule 11:00-18:00)
+    base_time = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    homeassistant.util.dt.set_time(base_time)
+    
+    # Initialize all central entities to good states
+    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=base_time)
+    states_db[state.entity_ids["status"]] = MockState("Sleeping", last_updated=base_time)
+    states_db[state.entity_ids["status_plain"]] = MockState("sleeping", last_updated=base_time)
+    states_db[state.entity_ids["battery"]] = MockState("100", last_updated=base_time)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=base_time)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=base_time)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=base_time)
+    
+    await manager._async_watchdog_check(base_time)
+    assert state.online is True
+    assert sensor.native_value == "ok"
+
+    async def set_status(status_val: str, t: datetime.datetime) -> None:
+        # Update states_db so states.get returns the new values
+        states_db[state.entity_ids["status"]] = MockState(status_val, last_updated=t)
+        states_db[state.entity_ids["status_plain"]] = MockState(status_val.lower(), last_updated=t)
+        
+        # Fire state events
+        e_status = MockEvent(state.entity_ids["status"], MockState(status_val, last_updated=t))
+        e_status_plain = MockEvent(state.entity_ids["status_plain"], MockState(status_val.lower(), last_updated=t))
+        await manager._async_state_changed_event(e_status)
+        await manager._async_state_changed_event(e_status_plain)
+    
+    # ----------------------------------------------------
+    # 1. Mowing startar exakt en session.
+    # ----------------------------------------------------
+    t_start = base_time + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_start)
+    await set_status("Mowing", t_start)
+    
+    assert state.mowing_session_active is True
+    assert state.session_started_at == t_start.isoformat()
+    assert state.session_started_source == "state_event"
+    assert state.accumulated_mowing_seconds == 0
+    assert state.session_start_battery == 100
+    assert state.session_start_distance == 1000.0
+    assert state.session_start_runtime_hours == 100.0
+    
+    # ----------------------------------------------------
+    # 2. Flera updates medan status fortsatt är Mowing startar inte nya sessioner.
+    # ----------------------------------------------------
+    t_update = t_start + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_update)
+    event_batt = MockEvent(state.entity_ids["battery"], MockState("99", last_updated=t_update))
+    await manager._async_state_changed_event(event_batt)
+    # Status updated again to mowing
+    await set_status("Mowing", t_update)
+    assert state.mowing_session_active is True
+    assert state.session_started_at == t_start.isoformat() # unchanged
+    
+    # ----------------------------------------------------
+    # 3. Mowing -> Searching -> Mowing inom 10 minuter är samma session.
+    # ----------------------------------------------------
+    t_search = t_update + datetime.timedelta(minutes=1) # 2 mins from start
+    homeassistant.util.dt.set_time(t_search)
+    await set_status("Searching", t_search)
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is True
+    assert state.interruption_status in ("Searching", "searching")
+    assert state.interruption_started_at == t_search.isoformat()
+    
+    t_resume = t_search + datetime.timedelta(minutes=5) # 7 mins from start
+    homeassistant.util.dt.set_time(t_resume)
+    await set_status("Mowing", t_resume)
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is False
+    assert state.interruption_started_at is None
+    assert state.session_started_at == t_start.isoformat()
+    
+    # ----------------------------------------------------
+    # 4. Mowing -> Detecting status -> Mowing inom 10 minuter är samma session.
+    # ----------------------------------------------------
+    t_detect = t_resume + datetime.timedelta(minutes=1) # 8 mins from start
+    homeassistant.util.dt.set_time(t_detect)
+    await set_status("Detecting status", t_detect)
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is True
+    
+    t_resume2 = t_detect + datetime.timedelta(minutes=5) # 13 mins from start
+    homeassistant.util.dt.set_time(t_resume2)
+    await set_status("Mowing", t_resume2)
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is False
+    assert state.session_started_at == t_start.isoformat()
+    
+    # Let's verify Mowing-time and Elapsed-time:
+    # 7. Faktisk Mowing-tid exkluderar Searching/Detecting-tiden.
+    # 8. Session elapsed inkluderar hela sessionens kalendertid.
+    t_mow_more = t_resume2 + datetime.timedelta(minutes=10) # 23 mins from start
+    homeassistant.util.dt.set_time(t_mow_more)
+    await manager._async_watchdog_check(t_mow_more)
+    assert abs(state.accumulated_mowing_seconds - 780) < 5
+    assert abs(state.session_elapsed_seconds - 1380) < 5
+    
+    # ----------------------------------------------------
+    # 5. Searching for charging station avslutar sessionen.
+    # ----------------------------------------------------
+    t_end = t_mow_more + datetime.timedelta(seconds=10)
+    homeassistant.util.dt.set_time(t_end)
+    await set_status("Charging", t_end)
+    assert state.mowing_session_active is False
+    
+    # Start fresh session
+    t_mow2 = t_end + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow2)
+    await set_status("Mowing", t_mow2)
+    assert state.mowing_session_active is True
+    
+    # Status to searching for charging station -> ends session
+    t_sfcs = t_mow2 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_sfcs)
+    await set_status("Searching for charging station", t_sfcs)
+    assert state.mowing_session_active is False
+    
+    # ----------------------------------------------------
+    # 6. Searching längre än 10 minuter ger interrupted_searching.
+    # ----------------------------------------------------
+    t_mow3 = t_sfcs + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow3)
+    await set_status("Mowing", t_mow3)
+    assert state.mowing_session_active is True
+    
+    t_interrupted = t_mow3 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_interrupted)
+    await set_status("Searching", t_interrupted)
+    assert state.mowing_session_active is True
+    
+    # Wait 11 minutes
+    t_after_interrupted = t_interrupted + datetime.timedelta(minutes=11)
+    homeassistant.util.dt.set_time(t_after_interrupted)
+    await manager._async_watchdog_check(t_after_interrupted)
+    assert state.mowing_session_active is False
+    assert state.last_mowing_attempt_result == "interrupted_searching"
+    
+    # ----------------------------------------------------
+    # 9. 2 minuters faktisk Mowing ger short_attempt.
+    # ----------------------------------------------------
+    t_mow4 = t_after_interrupted + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow4)
+    await set_status("Mowing", t_mow4)
+    
+    t_end4 = t_mow4 + datetime.timedelta(minutes=2)
+    homeassistant.util.dt.set_time(t_end4)
+    await set_status("Charging", t_end4)
+    assert state.last_mowing_attempt_result == "short_attempt"
+    
+    # ----------------------------------------------------
+    # 10. 6 minuters faktisk Mowing ger uncertain_attempt.
+    # ----------------------------------------------------
+    t_mow5 = t_end4 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow5)
+    await set_status("Mowing", t_mow5)
+    
+    t_end5 = t_mow5 + datetime.timedelta(minutes=6)
+    homeassistant.util.dt.set_time(t_end5)
+    await set_status("Searching for charging station", t_end5)
+    assert state.last_mowing_attempt_result == "uncertain_attempt"
+    
+    # ----------------------------------------------------
+    # 14. 15 minuters faktisk Mowing utan stödjande signal ger insufficient_supporting_data.
+    # ----------------------------------------------------
+    states_db[state.entity_ids["battery"]] = MockState("80", last_updated=t_end5)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=t_end5)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=t_end5)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("80", last_updated=t_end5)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["distance"], MockState("1000", last_updated=t_end5)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["statistic_hours"], MockState("100.0", last_updated=t_end5)))
+    
+    t_mow6 = t_end5 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow6)
+    await set_status("Mowing", t_mow6)
+    
+    t_end6 = t_mow6 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end6)
+    await set_status("Charging", t_end6)
+    assert state.last_mowing_attempt_result == "insufficient_supporting_data"
+    assert state.pending_mowing_confirmation is False
+    
+    # ----------------------------------------------------
+    # 11. 15 minuters faktisk Mowing plus distanceökning ger confirmation candidate -> confirmed_mowing.
+    # ----------------------------------------------------
+    t_mow7 = t_end6 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow7)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=t_mow7)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["distance"], MockState("1000", last_updated=t_mow7)))
+    await set_status("Mowing", t_mow7)
+    
+    t_dist_change = t_mow7 + datetime.timedelta(minutes=10)
+    homeassistant.util.dt.set_time(t_dist_change)
+    states_db[state.entity_ids["distance"]] = MockState("1002", last_updated=t_dist_change)
+    event_dist = MockEvent(state.entity_ids["distance"], MockState("1002", last_updated=t_dist_change))
+    await manager._async_state_changed_event(event_dist)
+    
+    t_end7 = t_mow7 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end7)
+    await set_status("Charging", t_end7)
+    assert state.last_mowing_attempt_result == "confirmation_candidate"
+    assert state.pending_mowing_confirmation is True
+    
+    t_grace_pass = t_end7 + datetime.timedelta(minutes=6)
+    homeassistant.util.dt.set_time(t_grace_pass)
+    await manager._async_watchdog_check(t_grace_pass)
+    assert state.last_mowing_attempt_result == "confirmed_mowing"
+    assert state.pending_mowing_confirmation is False
+    assert state.confirmed_mowing_today is True
+    
+    # ----------------------------------------------------
+    # 12. 15 minuters faktisk Mowing plus runtimeökning ger confirmation candidate.
+    # ----------------------------------------------------
+    state.confirmed_mowing_today = False
+    
+    t_mow8 = t_grace_pass + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow8)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=t_mow8)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["statistic_hours"], MockState("100.0", last_updated=t_mow8)))
+    await set_status("Mowing", t_mow8)
+    
+    t_run_change = t_mow8 + datetime.timedelta(minutes=10)
+    homeassistant.util.dt.set_time(t_run_change)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.02", last_updated=t_run_change)
+    event_run = MockEvent(state.entity_ids["statistic_hours"], MockState("100.02", last_updated=t_run_change))
+    await manager._async_state_changed_event(event_run)
+    
+    t_end8 = t_mow8 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end8)
+    await set_status("Charging", t_end8)
+    assert state.last_mowing_attempt_result == "confirmation_candidate"
+    
+    # ----------------------------------------------------
+    # 13. 15 minuters faktisk Mowing plus batterifall ger confirmation candidate.
+    # ----------------------------------------------------
+    t_mow9 = t_end8 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow9)
+    states_db[state.entity_ids["battery"]] = MockState("90", last_updated=t_mow9)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("90", last_updated=t_mow9)))
+    await set_status("Mowing", t_mow9)
+    
+    t_batt_change = t_mow9 + datetime.timedelta(minutes=10)
+    homeassistant.util.dt.set_time(t_batt_change)
+    states_db[state.entity_ids["battery"]] = MockState("87", last_updated=t_batt_change)
+    event_batt2 = MockEvent(state.entity_ids["battery"], MockState("87", last_updated=t_batt_change))
+    await manager._async_state_changed_event(event_batt2)
+    
+    t_end9 = t_mow9 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end9)
+    await set_status("Charging", t_end9)
+    assert state.last_mowing_attempt_result == "confirmation_candidate"
+    
+    # ----------------------------------------------------
+    # 15. Fel under session ger failed_error_during_mowing.
+    # ----------------------------------------------------
+    t_mow10 = t_end9 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow10)
+    await set_status("Mowing", t_mow10)
+    
+    t_err10 = t_mow10 + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_err10)
+    event_err = MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err10))
+    await manager._async_state_changed_event(event_err)
+    
+    await set_status("Error", t_err10)
+    assert state.last_mowing_attempt_result == "failed_error_during_mowing"
+    assert state.recovery_state == RecoveryState.ACTIVE_ERROR
+    
+    # ----------------------------------------------------
+    # 16. Fel inom fem minuter efter session ger failed_error_after_mowing.
+    # ----------------------------------------------------
+    t_clear = t_err10 + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_clear)
+    event_clear = MockEvent(state.entity_ids["error_message"], MockState("Fault 0", last_updated=t_clear))
+    await manager._async_state_changed_event(event_clear)
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    
+    t_mow11 = t_clear + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow11)
+    states_db[state.entity_ids["battery"]] = MockState("90", last_updated=t_mow11)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("90", last_updated=t_mow11)))
+    await set_status("Mowing", t_mow11)
+    
+    t_batt_change2 = t_mow11 + datetime.timedelta(minutes=10)
+    homeassistant.util.dt.set_time(t_batt_change2)
+    states_db[state.entity_ids["battery"]] = MockState("85", last_updated=t_batt_change2)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("85", last_updated=t_batt_change2)))
+    
+    t_end11 = t_mow11 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end11)
+    await set_status("Charging", t_end11)
+    assert state.last_mowing_attempt_result == "confirmation_candidate"
+    assert state.pending_mowing_confirmation is True
+    
+    t_err11 = t_end11 + datetime.timedelta(minutes=2)
+    homeassistant.util.dt.set_time(t_err11)
+    event_err2 = MockEvent(state.entity_ids["error_message"], MockState("No traction", last_updated=t_err11))
+    await manager._async_state_changed_event(event_err2)
+    assert state.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state.pending_mowing_confirmation is False
+    assert state.failed_recovery is True
+    assert sensor.native_value == "critical"
+    
+    # ----------------------------------------------------
+    # 19. Klippfel blir recovered först efter confirmed mowing.
+    # ----------------------------------------------------
+    state.recovery_state = RecoveryState.ACTIVE_ERROR
+    state.last_real_error = "Blade disc blocked"
+    state.last_real_error_category = "cutting"
+    state.failed_recovery = False
+    
+    t_clear2 = t_err11 + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_clear2)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Fault 0", last_updated=t_clear2)))
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    
+    # 21. Kort Mowing-försök efter tidigare fel ger inte recovered.
+    t_short_mow = t_clear2 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_short_mow)
+    await set_status("Mowing", t_short_mow)
+    t_short_end = t_short_mow + datetime.timedelta(minutes=2)
+    homeassistant.util.dt.set_time(t_short_end)
+    await set_status("Charging", t_short_end)
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    
+    # Run a proper confirmed mowing session
+    t_mow12 = t_short_end + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_mow12)
+    states_db[state.entity_ids["battery"]] = MockState("90", last_updated=t_mow12)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("90", last_updated=t_mow12)))
+    await set_status("Mowing", t_mow12)
+    
+    t_batt_change3 = t_mow12 + datetime.timedelta(minutes=10)
+    homeassistant.util.dt.set_time(t_batt_change3)
+    states_db[state.entity_ids["battery"]] = MockState("85", last_updated=t_batt_change3)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("85", last_updated=t_batt_change3)))
+    
+    t_end12 = t_mow12 + datetime.timedelta(minutes=15)
+    homeassistant.util.dt.set_time(t_end12)
+    await set_status("Charging", t_end12)
+    
+    # Confirm session
+    t_confirm12 = t_end12 + datetime.timedelta(minutes=6)
+    homeassistant.util.dt.set_time(t_confirm12)
+    await manager._async_watchdog_check(t_confirm12)
+    assert state.recovery_state == RecoveryState.RECOVERED
+    assert state.failed_recovery is False
+    
+    # ----------------------------------------------------
+    # 20. No traction blir recovered efter distanceökning eller confirmed mowing.
+    # ----------------------------------------------------
+    state.recovery_state = RecoveryState.ACTIVE_ERROR
+    state.last_real_error = "No traction"
+    state.last_real_error_category = "movement"
+    
+    t_clear3 = t_confirm12 + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_clear3)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Fault 0", last_updated=t_clear3)))
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    
+    t_dist_inc = t_clear3 + datetime.timedelta(minutes=1)
+    homeassistant.util.dt.set_time(t_dist_inc)
+    states_db[state.entity_ids["distance"]] = MockState("2000", last_updated=t_dist_inc)
+    await manager._async_watchdog_check(t_dist_inc)
+    assert state.recovery_state == RecoveryState.RECOVERED
+    
+    # ----------------------------------------------------
+    # 24. Dagliga flaggor återställs vid nytt datum i Europe/Stockholm.
+    # ----------------------------------------------------
+    state.confirmed_mowing_today = True
+    state.mowing_attempted_today = True
+    
+    t_next_day = t_dist_inc + datetime.timedelta(days=1)
+    homeassistant.util.dt.set_time(t_next_day)
+    await manager._async_watchdog_check(t_next_day)
+    assert state.confirmed_mowing_today is False
+    assert state.mowing_attempted_today is False
+    
+    # ----------------------------------------------------
+    # 25. Olöst fel raderas inte vid nytt datum.
+    # ----------------------------------------------------
+    t_another_day = t_next_day + datetime.timedelta(days=1)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_another_day)
+    states_db[state.entity_ids["error_binary"]] = MockState("on", last_updated=t_another_day)
+    state.recovery_state = RecoveryState.ACTIVE_ERROR
+    state.last_real_error = "Blade disc blocked"
+    
+    homeassistant.util.dt.set_time(t_another_day)
+    await manager._async_watchdog_check(t_another_day)
+    assert state.recovery_state == RecoveryState.ACTIVE_ERROR
+    assert state.last_real_error == "Blade disc blocked"
+    
+    # ----------------------------------------------------
+    # 26. Sleeping efter 18:00 är OK om inga problem finns.
+    # ----------------------------------------------------
+    t_evening = datetime.datetime(2026, 6, 9, 19, 0, 0, tzinfo=datetime.timezone.utc)
+    homeassistant.util.dt.set_time(t_evening)
+    states_db[state.entity_ids["status"]] = MockState("Sleeping", last_updated=t_evening)
+    states_db[state.entity_ids["status_plain"]] = MockState("sleeping", last_updated=t_evening)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=t_evening)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=t_evening)
+    states_db[state.entity_ids["battery"]] = MockState("100", last_updated=t_evening)
+    states_db[state.entity_ids["clock"]] = MockState("19:00", last_updated=t_evening)
+    
+    state.recovery_state = RecoveryState.NONE
+    state.last_real_error = None
+    state.current_error_active = False
+    
+    await manager._async_watchdog_check(t_evening)
+    assert sensor.native_value == "ok"
+    
+    # ----------------------------------------------------
+    # 27. Sleeping efter 18:00 är critical vid cleared_but_unverified.
+    # ----------------------------------------------------
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    assert sensor.native_value == "critical"
+    
+    # ----------------------------------------------------
+    # 28. HA-omstart mitt under Mowing skapar startup_observation.
+    # ----------------------------------------------------
+    manager_restart = AutomowerSupervisorManager(hass)
+    def mock_get_restart(entity_id: str) -> Any:
+        if entity_id == "sensor.automowerkv5_mower_status":
+            return MockState("Mowing")
+        if entity_id == "sensor.automowerkv5_mower_status_plain":
+            return MockState("mowing")
+        if "clock" in entity_id:
+            return MockState("12:00")
+        if "battery" in entity_id:
+            return MockState("90")
+        return None
+    hass.states.get = mock_get_restart
+    
+    await manager_restart.async_setup()
+    state_restart = manager_restart.robots[robot_id]
+    assert state_restart.mowing_session_active is True
+    assert state_restart.session_started_source == "startup_observation"
+    
+    # ----------------------------------------------------
+    # 29. HA-omstart under Searching skapar inte falsk session.
+    # ----------------------------------------------------
+    manager_restart2 = AutomowerSupervisorManager(hass)
+    def mock_get_restart2(entity_id: str) -> Any:
+        if entity_id == "sensor.automowerkv5_mower_status":
+            return MockState("Searching")
+        if "clock" in entity_id:
+            return MockState("12:00")
+        if "battery" in entity_id:
+            return MockState("90")
+        return None
+    hass.states.get = mock_get_restart2
+    await manager_restart2.async_setup()
+    state_restart2 = manager_restart2.robots[robot_id]
+    assert state_restart2.mowing_session_active is False
+    
+    # Restore mock states
+    hass.states.get = mock_get
+    
+    # ----------------------------------------------------
+    # 31. State events och watchdog dubbelräknar inte Mowing-tid.
+    # ----------------------------------------------------
+    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=base_time)
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=base_time)
+    
+    state.mowing_session_active = True
+    t_start31 = base_time
+    state.session_started_at = t_start31.isoformat()
+    state.current_mowing_segment_started_at = t_start31.isoformat()
+    state.accumulated_mowing_seconds = 0
+    
+    t_event = t_start31 + datetime.timedelta(minutes=2)
+    homeassistant.util.dt.set_time(t_event)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["battery"], MockState("95", last_updated=t_event)))
+    assert state.accumulated_mowing_seconds == 120
+    
+    await manager._async_watchdog_check(t_event)
+    assert state.accumulated_mowing_seconds == 120
+    
+    # ----------------------------------------------------
+    # 32, 33, 34. Saknad distance, runtime och batterisensor kraschar inte.
+    # ----------------------------------------------------
+    for key in ["distance", "statistic_hours", "battery"]:
+        states_db[state.entity_ids[key]] = None
+    
+    manager.sync_initial_states()
+    await manager._async_watchdog_check(homeassistant.util.dt.now())
+    
+    # ----------------------------------------------------
+    # 37. Persistent data från 0.2.3 kan laddas.
+    # ----------------------------------------------------
+    manager_load_old = AutomowerSupervisorManager(hass)
+    manager_load_old._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_at": "2026-06-08T15:40:26+02:00",
+            "error_cleared_at": None,
+            "current_error_active": True,
+            "recovery_state": "active_error"
+        }
+    }
+    await manager_load_old._async_load_storage()
+    state_old = manager_load_old.robots["automowerkv5"]
+    assert state_old.last_real_error == "Blade disc blocked"
+    assert state_old.recovery_state == RecoveryState.ACTIVE_ERROR
+    assert state_old.confirmed_mowing_today is False
+    
+    # ----------------------------------------------------
+    # 38. Ny aktivitetsdata återladdas efter omstart.
+    # ----------------------------------------------------
+    manager_load_new = AutomowerSupervisorManager(hass)
+    manager_load_new._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_at": "2026-06-08T15:40:26+02:00",
+            "error_cleared_at": None,
+            "current_error_active": True,
+            "recovery_state": "active_error",
+            "confirmed_mowing_today": True,
+            "mowing_attempted_today": True,
+            "daily_date": "2026-06-09"
+        }
+    }
+    await manager_load_new._async_load_storage()
+    state_new = manager_load_new.robots["automowerkv5"]
+    assert state_new.confirmed_mowing_today is True
+    assert state_new.mowing_attempted_today is True
+    assert state_new.daily_date == "2026-06-09"
+    
+    # ----------------------------------------------------
+    # 39. Sensorattribut är korrekta.
+    # 40. Reason codes är korrekta och utan dubletter.
+    # ----------------------------------------------------
+    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=base_time)
+    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=base_time)
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=base_time)
+    states_db[state.entity_ids["battery"]] = MockState("90", last_updated=base_time)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=base_time)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=base_time)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=base_time)
+    
+    manager.sync_initial_states()
+    await manager._async_watchdog_check(base_time)
+    
+    attrs = sensor.extra_state_attributes
+    assert "mowing_session_active" in attrs
+    assert "session_started_at" in attrs
+    assert "accumulated_mowing_seconds" in attrs
+    assert "last_mowing_attempt_result" in attrs
+    assert "confirmed_mowing_today" in attrs
+    assert "failed_recovery" in attrs
+    assert "last_real_error_category" in attrs
+    
+    reasons = attrs["assessment_reasons"]
+    assert len(reasons) == len(set(reasons))
 
 
 

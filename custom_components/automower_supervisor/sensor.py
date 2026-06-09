@@ -10,10 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+import homeassistant.util.dt as dt_util
 
 from .const import DOMAIN, NO_ACTIVE_ERROR_VALUES
 from .manager import AutomowerSupervisorManager, get_robot_suffix
 from .models import RecoveryState
+from .schedule import is_scheduled_now
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,23 +76,22 @@ class AutomowerRobotSensor(SensorEntity):
         """Return the state of the sensor."""
         state_data = self.manager.robots[self.robot_id]
 
-        # 1. Critical state (active error or cleared but unverified)
+        # 1. Critical state (active error or cleared but unverified or failed recovery or offline)
         is_critical = (
             state_data.current_error_active
+            or state_data.binary_error == "on"
             or state_data.recovery_state in (RecoveryState.ACTIVE_ERROR, RecoveryState.CLEARED_BUT_UNVERIFIED)
+            or state_data.failed_recovery
+            or state_data.online is False
         )
         if is_critical:
             return "critical"
 
-        # 2. Critical state due to offline (online = False)
-        if state_data.online is False:
-            return "critical"
-
-        # 3. Warning state due to stale data
+        # 2. Warning state due to stale data (takes precedence over insufficient data)
         if state_data.online is True and state_data.source_age_minutes is not None and 15 < state_data.source_age_minutes <= 60:
             return "warning"
 
-        # 4. Warning / Insufficient Data state based on HA entity status
+        # 3. Check for Insufficient Data state based on HA entity status
         central_keys = ["status", "status_plain", "battery", "error_message", "error_binary", "clock"]
         
         missing_centrals = [
@@ -110,6 +111,19 @@ class AutomowerRobotSensor(SensorEntity):
         available_count = len(central_keys) - len(missing_centrals) - len(unavailable_centrals) - len(unknown_centrals)
         if available_count < 2:
             return "insufficient_data"
+
+        # 4. Warning state due to uncertain mowing session attempts
+        if state_data.last_mowing_attempt_result in ("uncertain_attempt", "interrupted_searching"):
+            return "warning"
+
+        # 5. Warning state if schedule active, attempted but not confirmed today
+        if is_scheduled_now(dt_util.now()):
+            if state_data.mowing_attempted_today and not state_data.confirmed_mowing_today:
+                return "warning"
+
+        # 6. Warning state if mowing is active but not yet confirmed today
+        if state_data.mowing_session_active and not state_data.confirmed_mowing_today:
+            return "warning"
 
         # Warning state if any central entity is missing, unavailable or unknown
         if missing_centrals or unavailable_centrals or unknown_centrals:
@@ -171,6 +185,46 @@ class AutomowerRobotSensor(SensorEntity):
         if available_count < 2:
             reasons.append("INSUFFICIENT_DATA")
 
+        # Mowing Session / Attempt Reason Codes
+        if state_data.mowing_session_active:
+            reasons.append("MOWING_SESSION_ACTIVE")
+            
+        if state_data.last_mowing_attempt_result == "short_attempt":
+            reasons.append("MOWING_ATTEMPT_SHORT")
+        elif state_data.last_mowing_attempt_result == "uncertain_attempt":
+            reasons.append("MOWING_ATTEMPT_UNCERTAIN")
+        elif state_data.last_mowing_attempt_result == "interrupted_searching":
+            reasons.append("MOWING_INTERRUPTED_SEARCHING")
+        elif state_data.last_mowing_attempt_result == "confirmed_mowing":
+            reasons.append("CONFIRMED_MOWING")
+        elif state_data.last_mowing_attempt_result == "failed_error_during_mowing":
+            reasons.append("ERROR_DURING_MOWING")
+        elif state_data.last_mowing_attempt_result == "failed_error_after_mowing":
+            reasons.append("ERROR_AFTER_MOWING")
+        elif state_data.last_mowing_attempt_result == "insufficient_supporting_data":
+            reasons.append("NO_SUPPORTING_ACTIVITY")
+            reasons.append("NO_DISTANCE_CHANGE")
+            reasons.append("NO_RUNTIME_CHANGE")
+            
+        if is_scheduled_now(dt_util.now()):
+            if state_data.mowing_attempted_today and not state_data.confirmed_mowing_today:
+                reasons.append("MOWING_NOT_CONFIRMED")
+                
+        if state_data.failed_recovery:
+            reasons.append("FAILED_RECOVERY")
+            
+        if state_data.recovery_state == RecoveryState.RECOVERED:
+            reasons.append("RECOVERY_VERIFIED")
+            
+        if state_data.pending_mowing_confirmation:
+            reasons.append("PENDING_MOWING_CONFIRMATION")
+
+        # Deduplicate reasons list
+        unique_reasons = []
+        for r in reasons:
+            if r not in unique_reasons:
+                unique_reasons.append(r)
+
         source_values_stale = (
             state_data.online is False
             or state_data.online is None
@@ -195,13 +249,48 @@ class AutomowerRobotSensor(SensorEntity):
             "unknown_entities": state_data.unknown_entities,
             "last_event_at": state_data.last_event_at,
             "entity_ids": state_data.entity_ids,
-            "assessment_reasons": reasons,
+            "assessment_reasons": unique_reasons,
             "online": state_data.online,
             "last_source_update_at": state_data.last_source_update_at,
             "source_age_minutes": state_data.source_age_minutes,
             "stale_entities": state_data.stale_entities,
             "watchdog_checked_at": self.manager.watchdog_checked_at,
             "source_values_stale": source_values_stale,
+            # Schedule properties
+            "scheduled_now": is_scheduled_now(dt_util.now()),
+            "schedule_start": 11,
+            "schedule_end": 18,
+            "schedule_timezone": "Europe/Stockholm",
+            # Active Mowing Session
+            "mowing_session_active": state_data.mowing_session_active,
+            "session_started_at": state_data.session_started_at,
+            "session_started_source": state_data.session_started_source,
+            "session_elapsed_seconds": state_data.session_elapsed_seconds,
+            "accumulated_mowing_seconds": state_data.accumulated_mowing_seconds,
+            "current_mowing_segment_started_at": state_data.current_mowing_segment_started_at,
+            "interruption_started_at": state_data.interruption_started_at,
+            "interruption_status": state_data.interruption_status,
+            "pending_session_end": state_data.pending_session_end,
+            # Last Attempt / Confirmed
+            "last_mowing_attempt_at": state_data.last_mowing_attempt_at,
+            "last_mowing_attempt_duration_seconds": state_data.last_mowing_attempt_duration_seconds,
+            "last_mowing_session_elapsed_seconds": state_data.last_mowing_session_elapsed_seconds,
+            "last_mowing_attempt_result": state_data.last_mowing_attempt_result,
+            "last_mowing_ended_at": state_data.last_mowing_ended_at,
+            "pending_mowing_confirmation": state_data.pending_mowing_confirmation,
+            "last_confirmed_mowing_at": state_data.last_confirmed_mowing_at,
+            "last_confirmed_mowing_duration_seconds": state_data.last_confirmed_mowing_duration_seconds,
+            "confirmed_mowing_today": state_data.confirmed_mowing_today,
+            "mowing_attempted_today": state_data.mowing_attempted_today,
+            # Supporting activity deltas
+            "last_distance_value": state_data.last_distance_value,
+            "last_distance_change_at": state_data.last_distance_change_at,
+            "last_runtime_hours_value": state_data.last_runtime_hours_value,
+            "last_runtime_change_at": state_data.last_runtime_change_at,
+            # Recovery
+            "failed_recovery": state_data.failed_recovery,
+            "recovery_verified_at": state_data.recovery_verified_at,
+            "last_real_error_category": state_data.last_real_error_category,
         }
 
 
@@ -253,6 +342,13 @@ class AutomowerDiscoverySensor(SensorEntity):
         robots_offline = 0
         robots_unknown_online_state = 0
 
+        # Totals for v0.3.0
+        robots_mowing_now = 0
+        robots_with_active_mowing_session = 0
+        robots_confirmed_mowing_today = 0
+        robots_with_failed_recovery = 0
+        robots_with_pending_confirmation = 0
+
         for robot_id, state_data in self.manager.robots.items():
             # Watchdog status counts
             if state_data.online is True:
@@ -264,6 +360,22 @@ class AutomowerDiscoverySensor(SensorEntity):
                 robots_offline += 1
             else:
                 robots_unknown_online_state += 1
+
+            # Mowing session totals
+            status_norm = (state_data.current_status_plain or "").strip().lower()
+            if not status_norm and state_data.current_status:
+                status_norm = state_data.current_status.strip().lower()
+            if status_norm == "mowing":
+                robots_mowing_now += 1
+
+            if state_data.mowing_session_active:
+                robots_with_active_mowing_session += 1
+            if state_data.confirmed_mowing_today:
+                robots_confirmed_mowing_today += 1
+            if state_data.failed_recovery:
+                robots_with_failed_recovery += 1
+            if state_data.pending_mowing_confirmation:
+                robots_with_pending_confirmation += 1
 
             found_keys = []
             missing_keys = []
@@ -293,6 +405,13 @@ class AutomowerDiscoverySensor(SensorEntity):
                 "online": state_data.online,
                 "source_age_minutes": state_data.source_age_minutes,
                 "last_source_update_at": state_data.last_source_update_at,
+                # v0.3.0 fields per robot
+                "scheduled_now": is_scheduled_now(dt_util.now()),
+                "mowing_session_active": state_data.mowing_session_active,
+                "confirmed_mowing_today": state_data.confirmed_mowing_today,
+                "failed_recovery": state_data.failed_recovery,
+                "last_mowing_attempt_result": state_data.last_mowing_attempt_result,
+                "pending_mowing_confirmation": state_data.pending_mowing_confirmation,
             }
 
         total_found = total_expected - total_missing - total_unavailable - total_unknown
@@ -310,5 +429,10 @@ class AutomowerDiscoverySensor(SensorEntity):
             "robots_offline": robots_offline,
             "robots_unknown_online_state": robots_unknown_online_state,
             "watchdog_checked_at": self.manager.watchdog_checked_at,
+            "robots_mowing_now": robots_mowing_now,
+            "robots_with_active_mowing_session": robots_with_active_mowing_session,
+            "robots_confirmed_mowing_today": robots_confirmed_mowing_today,
+            "robots_with_failed_recovery": robots_with_failed_recovery,
+            "robots_with_pending_confirmation": robots_with_pending_confirmation,
             "robots": robots_dict,
         }

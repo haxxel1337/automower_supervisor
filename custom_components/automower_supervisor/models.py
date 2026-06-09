@@ -49,3 +49,55 @@ class RobotState:
     source_age_minutes: int | None = None
     online: bool | None = None
     stale_entities: list[str] = field(default_factory=list)
+
+    # Active Mowing Session
+    mowing_session_active: bool = False
+    session_started_at: str | None = None
+    session_started_source: str | None = None  # "state_event" or "startup_observation"
+    session_elapsed_seconds: int = 0
+    accumulated_mowing_seconds: int = 0
+    current_mowing_segment_started_at: str | None = None
+    
+    interruption_started_at: str | None = None
+    interruption_status: str | None = None
+    pending_session_end: bool = False
+    
+    session_start_battery: int | None = None
+    session_start_distance: float | None = None
+    session_start_runtime_hours: float | None = None
+    
+    session_latest_battery: int | None = None
+    session_latest_distance: float | None = None
+    session_latest_runtime_hours: float | None = None
+    
+    session_error_detected: bool = False
+    session_binary_error_detected: bool = False
+    session_last_mowing_ended_at: str | None = None
+    pending_mowing_confirmation: bool = False
+
+    # Last Session/Attempt (Persisted)
+    last_mowing_attempt_at: str | None = None
+    last_mowing_attempt_duration_seconds: int | None = None
+    last_mowing_session_elapsed_seconds: int | None = None
+    last_mowing_attempt_result: str | None = None
+    last_mowing_ended_at: str | None = None
+
+    # Confirmed Mowing (Persisted)
+    last_confirmed_mowing_at: str | None = None
+    last_confirmed_mowing_duration_seconds: int | None = None
+    confirmed_mowing_today: bool = False
+    mowing_attempted_today: bool = False
+
+    # Supporting Activity Tracking (Persisted)
+    last_distance_value: float | None = None
+    last_distance_change_at: str | None = None
+    last_runtime_hours_value: float | None = None
+    last_runtime_change_at: str | None = None
+
+    # Recovery Tracking (Persisted)
+    failed_recovery: bool = False
+    recovery_verified_at: str | None = None
+    last_real_error_category: str = "none"
+
+    # Daily state (Persisted)
+    daily_date: str | None = None

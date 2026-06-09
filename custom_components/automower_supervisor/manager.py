@@ -1,5 +1,3 @@
-"""Central manager for the Automower Supervisor integration."""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -13,6 +11,18 @@ import homeassistant.util.dt as dt_util
 from .const import ROBOTS, ENTITY_PATTERNS, NO_ACTIVE_ERROR_VALUES
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
+from .error_classifier import classify_error
+from .schedule import get_daily_date
+from .activity import (
+    safe_float,
+    safe_int,
+    update_accumulated_mowing_time,
+    update_session_latest_values,
+    end_mowing_session,
+    check_pending_mowing_confirmation,
+    handle_status_change,
+    check_daily_rollover,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,14 +43,6 @@ def get_robot_suffix(robot_id: str) -> str:
         "automowerlv9": "lv9",
     }
     return mapping.get(robot_id, robot_id)
-
-
-def safe_int(val: Any) -> int | None:
-    """Safely convert value to integer."""
-    try:
-        return int(float(str(val)))
-    except (ValueError, TypeError):
-        return None
 
 
 def _update_entity_state_lists(state: RobotState, entity_id: str, target_list_name: str | None) -> None:
@@ -95,7 +97,7 @@ class AutomowerSupervisorManager:
         await self._async_load_storage()
         
         # Initial scan of current state machine states
-        storage_changed = self.sync_initial_states()
+        storage_changed = self.sync_initial_states(is_startup=True)
         
         # Set watchdog checked time and calculate metrics directly
         now = dt_util.now()
@@ -118,6 +120,12 @@ class AutomowerSupervisorManager:
 
     async def _async_load_storage(self) -> None:
         """Load persistent storage and apply it to the robot states."""
+        # Initialize daily_date for all robots first to prevent unwanted first-run save calls
+        now = dt_util.now()
+        current_date = get_daily_date(now)
+        for state in self.robots.values():
+            state.daily_date = current_date
+
         stored_data = await self._storage.async_load()
         if not stored_data:
             _LOGGER.debug("No persistent storage data found")
@@ -140,6 +148,25 @@ class AutomowerSupervisorManager:
             except ValueError:
                 state.recovery_state = RecoveryState.NONE
 
+            state.last_mowing_attempt_at = data.get("last_mowing_attempt_at")
+            state.last_mowing_attempt_duration_seconds = data.get("last_mowing_attempt_duration_seconds")
+            state.last_mowing_session_elapsed_seconds = data.get("last_mowing_session_elapsed_seconds")
+            state.last_mowing_attempt_result = data.get("last_mowing_attempt_result")
+            state.last_mowing_ended_at = data.get("last_mowing_ended_at")
+            state.last_confirmed_mowing_at = data.get("last_confirmed_mowing_at")
+            state.last_confirmed_mowing_duration_seconds = data.get("last_confirmed_mowing_duration_seconds")
+            state.last_distance_value = data.get("last_distance_value")
+            state.last_distance_change_at = data.get("last_distance_change_at")
+            state.last_runtime_hours_value = data.get("last_runtime_hours_value")
+            state.last_runtime_change_at = data.get("last_runtime_change_at")
+            state.confirmed_mowing_today = bool(data.get("confirmed_mowing_today", False))
+            state.mowing_attempted_today = bool(data.get("mowing_attempted_today", False))
+            state.failed_recovery = bool(data.get("failed_recovery", False))
+            state.recovery_verified_at = data.get("recovery_verified_at")
+            state.last_real_error_category = data.get("last_real_error_category", "none")
+            if "daily_date" in data and data["daily_date"] is not None:
+                state.daily_date = data["daily_date"]
+
     def get_storage_data(self) -> dict[str, dict[str, Any]]:
         """Return a dictionary of serializable state information to store on disk."""
         data = {}
@@ -150,15 +177,37 @@ class AutomowerSupervisorManager:
                 "error_cleared_at": state.error_cleared_at,
                 "current_error_active": state.current_error_active,
                 "recovery_state": str(state.recovery_state.value),
+                "last_mowing_attempt_at": state.last_mowing_attempt_at,
+                "last_mowing_attempt_duration_seconds": state.last_mowing_attempt_duration_seconds,
+                "last_mowing_session_elapsed_seconds": state.last_mowing_session_elapsed_seconds,
+                "last_mowing_attempt_result": state.last_mowing_attempt_result,
+                "last_mowing_ended_at": state.last_mowing_ended_at,
+                "last_confirmed_mowing_at": state.last_confirmed_mowing_at,
+                "last_confirmed_mowing_duration_seconds": state.last_confirmed_mowing_duration_seconds,
+                "last_distance_value": state.last_distance_value,
+                "last_distance_change_at": state.last_distance_change_at,
+                "last_runtime_hours_value": state.last_runtime_hours_value,
+                "last_runtime_change_at": state.last_runtime_change_at,
+                "confirmed_mowing_today": state.confirmed_mowing_today,
+                "mowing_attempted_today": state.mowing_attempted_today,
+                "failed_recovery": state.failed_recovery,
+                "recovery_verified_at": state.recovery_verified_at,
+                "last_real_error_category": state.last_real_error_category,
+                "daily_date": state.daily_date,
             }
         return data
 
-    def sync_initial_states(self) -> bool:
+    def sync_initial_states(self, is_startup: bool = False) -> bool:
         """Sync initial states of entities from Home Assistant."""
-        current_time_iso = dt_util.now().isoformat()
+        now = dt_util.now()
+        current_time_iso = now.isoformat()
         storage_changed = False
         
         for robot_id, state in self.robots.items():
+            # Check daily rollover first
+            if check_daily_rollover(state, now):
+                storage_changed = True
+
             # Clear discovery lists for initial scan
             state.missing_entities.clear()
             state.unavailable_entities.clear()
@@ -183,6 +232,36 @@ class AutomowerSupervisorManager:
             # Evaluate error state after initial loading
             if self._update_robot_error_state(robot_id, current_time_iso):
                 storage_changed = True
+
+            # Handle HA restart during Mowing
+            if is_startup:
+                status_norm = (state.current_status_plain or "").strip().lower()
+                if not status_norm and state.current_status:
+                    status_norm = state.current_status.strip().lower()
+                if status_norm == "mowing" and not state.mowing_session_active:
+                    state.mowing_session_active = True
+                    state.session_started_at = dt_util.as_utc(now).isoformat()
+                    state.session_started_source = "startup_observation"
+                    state.current_mowing_segment_started_at = dt_util.as_utc(now).isoformat()
+                    state.accumulated_mowing_seconds = 0
+                    state.session_elapsed_seconds = 0
+                    
+                    state.session_start_battery = state.current_battery
+                    state.session_start_distance = state.last_distance_value
+                    state.session_start_runtime_hours = state.last_runtime_hours_value
+                    
+                    state.session_latest_battery = state.current_battery
+                    state.session_latest_distance = state.last_distance_value
+                    state.session_latest_runtime_hours = state.last_runtime_hours_value
+                    
+                    state.session_error_detected = False
+                    state.session_binary_error_detected = False
+                    state.pending_session_end = False
+                    state.pending_mowing_confirmation = False
+                    
+                    state.mowing_attempted_today = True
+                    state.last_mowing_attempt_at = state.session_started_at
+                    storage_changed = True
 
         return storage_changed
 
@@ -217,45 +296,109 @@ class AutomowerSupervisorManager:
         current_time_iso = dt_util.now().isoformat()
         state.last_event_at = current_time_iso
         
+        now = dt_util.now()
+        storage_changed = check_daily_rollover(state, now)
+        
+        if state.mowing_session_active:
+            update_accumulated_mowing_time(state, now)
+        
         # Update lists and state values
         if new_state is None:
             _update_entity_state_lists(state, entity_id, "missing")
-            self._update_state_field(state, key, None)
+            if self._update_state_field(state, key, None):
+                storage_changed = True
         elif new_state.state == "unavailable":
             _update_entity_state_lists(state, entity_id, "unavailable")
-            self._update_state_field(state, key, None)
+            if self._update_state_field(state, key, None):
+                storage_changed = True
         elif new_state.state == "unknown":
             _update_entity_state_lists(state, entity_id, "unknown")
-            self._update_state_field(state, key, None)
+            if self._update_state_field(state, key, None):
+                storage_changed = True
         else:
             _update_entity_state_lists(state, entity_id, None)
-            self._update_state_field(state, key, new_state.state)
-            
+            if self._update_state_field(state, key, new_state.state):
+                storage_changed = True
+                
+        # If status changed, handle session state machine
+        if key in ("status_plain", "status"):
+            status_val = state.current_status_plain
+            if not status_val:
+                status_val = state.current_status
+            if handle_status_change(state, status_val, now):
+                storage_changed = True
+                
         # Update watchdog metrics in real-time
-        self._update_watchdog_for_robot(robot_id, dt_util.now())
+        self._update_watchdog_for_robot(robot_id, now)
             
         # Re-evaluate logic for errors
-        storage_changed = self._update_robot_error_state(robot_id, current_time_iso)
-        
+        if self._update_robot_error_state(robot_id, current_time_iso):
+            storage_changed = True
+            
         if storage_changed:
-            _LOGGER.debug("Error state changed for %s, saving to storage", robot_id)
+            _LOGGER.debug("Data changed for %s, saving/scheduling save to storage", robot_id)
             self._storage.async_delay_save(self.get_storage_data, 10.0)
             
         # Notify registered UI sensors
         self._notify_callbacks()
 
-    def _update_state_field(self, state: RobotState, key: str, value: str | None) -> None:
-        """Update the real-time field based on the entity key."""
+    def _update_state_field(self, state: RobotState, key: str, value: str | None) -> bool:
+        """Update the real-time field based on the entity key. Returns True if storage changed."""
+        storage_changed = False
         if key == "status":
             state.current_status = value
         elif key == "status_plain":
             state.current_status_plain = value
         elif key == "battery":
-            state.current_battery = safe_int(value)
+            val_int = safe_int(value)
+            state.current_battery = val_int
+            if state.mowing_session_active:
+                state.session_latest_battery = val_int
+                if state.session_start_battery is None:
+                    state.session_start_battery = val_int
         elif key == "error_message":
             state.current_error_message = value
         elif key == "error_binary":
             state.binary_error = value
+            if value == "on":
+                if state.mowing_session_active:
+                    state.session_binary_error_detected = True
+                if state.pending_mowing_confirmation:
+                    state.pending_mowing_confirmation = False
+                    state.last_mowing_attempt_result = "failed_error_after_mowing"
+                    state.failed_recovery = True
+                    storage_changed = True
+        elif key == "distance":
+            val_float = safe_float(value)
+            if state.mowing_session_active:
+                state.session_latest_distance = val_float
+                if state.session_start_distance is None:
+                    state.session_start_distance = val_float
+            if val_float is not None and val_float != state.last_distance_value:
+                # If in cleared but unverified and category is movement, check delta for recovery
+                if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED and state.last_real_error_category == "movement":
+                    if state.last_distance_value is not None:
+                        delta = val_float - state.last_distance_value
+                        if delta >= 1.0:
+                            state.recovery_state = RecoveryState.RECOVERED
+                            state.failed_recovery = False
+                            state.recovery_verified_at = dt_util.as_utc(dt_util.now()).isoformat()
+                            storage_changed = True
+                state.last_distance_value = val_float
+                state.last_distance_change_at = dt_util.as_utc(dt_util.now()).isoformat()
+                storage_changed = True
+        elif key == "statistic_hours":
+            val_float = safe_float(value)
+            if state.mowing_session_active:
+                state.session_latest_runtime_hours = val_float
+                if state.session_start_runtime_hours is None:
+                    state.session_start_runtime_hours = val_float
+            if val_float is not None and val_float != state.last_runtime_hours_value:
+                state.last_runtime_hours_value = val_float
+                state.last_runtime_change_at = dt_util.as_utc(dt_util.now()).isoformat()
+                storage_changed = True
+                
+        return storage_changed
 
     def _update_robot_error_state(self, robot_id: str, current_time_iso: str) -> bool:
         """Evaluate the robot error state machine. Returns True if storage fields changed."""
@@ -279,6 +422,8 @@ class AutomowerSupervisorManager:
                 state.current_error_active = True
                 changed = True
             if state.recovery_state != RecoveryState.ACTIVE_ERROR:
+                if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+                    state.failed_recovery = True
                 state.recovery_state = RecoveryState.ACTIVE_ERROR
                 changed = True
             if state.error_cleared_at is not None:
@@ -290,7 +435,22 @@ class AutomowerSupervisorManager:
                 if not was_error_active or state.last_real_error != state.current_error_message:
                     state.last_real_error = state.current_error_message
                     state.last_real_error_at = current_time_iso
+                    state.last_real_error_category = classify_error(state.current_error_message)
                     changed = True
+
+            # If there is an active session, mark error detected
+            if state.mowing_session_active:
+                if is_real_error:
+                    state.session_error_detected = True
+                if is_binary_error:
+                    state.session_binary_error_detected = True
+
+            # If pending mowing confirmation, cancel it and mark failed_recovery = True
+            if state.pending_mowing_confirmation:
+                state.pending_mowing_confirmation = False
+                state.last_mowing_attempt_result = "failed_error_after_mowing"
+                state.failed_recovery = True
+                changed = True
         else:
             # No active error reported by sensors
             if state.recovery_state == RecoveryState.ACTIVE_ERROR:
@@ -436,11 +596,50 @@ class AutomowerSupervisorManager:
         self.watchdog_checked_at = now.isoformat()
         
         # Sync states for all robots to ensure we have the absolute latest states from HA
-        storage_changed = self.sync_initial_states()
+        storage_changed = self.sync_initial_states(is_startup=False)
         
-        # Update watchdog metrics for all robots
-        for robot_id in self.robots:
+        # Update watchdog metrics and perform session/interruption checks for all robots
+        for robot_id, state in self.robots.items():
             self._update_watchdog_for_robot(robot_id, now)
+            
+            # Daily rollover
+            if check_daily_rollover(state, now):
+                storage_changed = True
+                
+            # If session is active:
+            if state.mowing_session_active:
+                update_accumulated_mowing_time(state, now)
+                update_session_latest_values(state)
+                
+                # Check interruption grace period
+                if state.pending_session_end and state.interruption_started_at:
+                    int_start = datetime.fromisoformat(state.interruption_started_at)
+                    int_start_utc = dt_util.as_utc(int_start)
+                    now_utc = dt_util.as_utc(now)
+                    int_duration = (now_utc - int_start_utc).total_seconds()
+                    if int_duration > 600: # 10 minutes
+                        if end_mowing_session(state, now, "interrupted_searching"):
+                            storage_changed = True
+                            
+                # Safeguard: if session is active but current status is terminating
+                status_norm = (state.current_status_plain or "").strip().lower()
+                if not status_norm and state.current_status:
+                    status_norm = state.current_status.strip().lower()
+                    
+                terminating_statuses = {
+                    "error", "fault", "charging", "sleeping", "parked", 
+                    "way home", "searching for charging station", "stopped", "off"
+                }
+                if status_norm in terminating_statuses:
+                    if status_norm in ("error", "fault"):
+                        state.session_error_detected = True
+                    if end_mowing_session(state, now):
+                        storage_changed = True
+                        
+            # Check pending confirmation 5 minutes timeout
+            if state.pending_mowing_confirmation:
+                if check_pending_mowing_confirmation(state, now):
+                    storage_changed = True
             
         if storage_changed:
             _LOGGER.debug("Storage changed during watchdog check, scheduling delayed save")
