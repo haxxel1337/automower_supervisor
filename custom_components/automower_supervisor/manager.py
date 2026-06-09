@@ -95,11 +95,14 @@ class AutomowerSupervisorManager:
         await self._async_load_storage()
         
         # Initial scan of current state machine states
-        self.sync_initial_states()
+        storage_changed = self.sync_initial_states()
         
         # Watchdog assessment run immediately once
         await self._async_watchdog_check(dt_util.now())
         
+        if storage_changed:
+            await self._storage.async_save(self.get_storage_data())
+            
         # Register listeners
         self.setup_listeners()
 
@@ -147,9 +150,10 @@ class AutomowerSupervisorManager:
             }
         return data
 
-    def sync_initial_states(self) -> None:
+    def sync_initial_states(self) -> bool:
         """Sync initial states of entities from Home Assistant."""
         current_time_iso = dt_util.now().isoformat()
+        storage_changed = False
         
         for robot_id, state in self.robots.items():
             # Clear discovery lists for initial scan
@@ -174,7 +178,10 @@ class AutomowerSupervisorManager:
                     self._update_state_field(state, key, ha_state.state)
                     
             # Evaluate error state after initial loading
-            self._update_robot_error_state(robot_id, current_time_iso)
+            if self._update_robot_error_state(robot_id, current_time_iso):
+                storage_changed = True
+
+        return storage_changed
 
     def setup_listeners(self) -> None:
         """Setup listeners for state change events."""
@@ -338,7 +345,7 @@ class AutomowerSupervisorManager:
         # Write storage synchronously/immediately before unload completes
         await self._storage.async_save(self.get_storage_data())
 
-    def _update_watchdog_for_robot(self, robot_id: str, now: datetime.datetime) -> None:
+    def _update_watchdog_for_robot(self, robot_id: str, now: datetime) -> None:
         """Calculate and update state age/online watchdog metrics for a single robot."""
         state = self.robots[robot_id]
         
@@ -368,19 +375,12 @@ class AutomowerSupervisorManager:
                     
         state.stale_entities.clear()
         
-        if not existing_heartbeats:
-            state.online = None
-            state.last_source_update_at = None
-            state.source_age_minutes = None
-        elif not useful_heartbeats:
-            state.online = False
-            state.last_source_update_at = None
-            state.source_age_minutes = None
-        else:
+        if useful_heartbeats:
             # Find latest useful update
             latest_ha_state = max(useful_heartbeats, key=lambda item: item[1].last_updated)[1]
             latest_dt = latest_ha_state.last_updated
             state.last_source_update_at = latest_dt.isoformat()
+            state.last_heartbeat_seen_at = latest_dt.isoformat()
             
             now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
             latest_dt_naive = latest_dt.replace(tzinfo=None) if latest_dt.tzinfo is not None else latest_dt
@@ -404,18 +404,44 @@ class AutomowerSupervisorManager:
                 entity_age = (now_naive - ha_updated_naive).total_seconds() / 60
                 if entity_age > 15:
                     state.stale_entities.append(entity_id)
+        else:
+            # No useful heartbeats currently available
+            if state.last_heartbeat_seen_at is not None:
+                # Use the previously seen heartbeat time
+                seen_dt = datetime.fromisoformat(state.last_heartbeat_seen_at)
+                
+                now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
+                seen_dt_naive = seen_dt.replace(tzinfo=None) if seen_dt.tzinfo is not None else seen_dt
+                
+                age_delta = now_naive - seen_dt_naive
+                age_min = max(0, int(age_delta.total_seconds() / 60))
+                state.source_age_minutes = age_min
+                
+                if age_min <= 15:
+                    state.online = True
+                elif age_min > 60:
+                    state.online = False
+                else:
+                    state.online = True
+            else:
+                state.online = None
+                state.source_age_minutes = None
 
-    async def _async_watchdog_check(self, now: datetime.datetime) -> None:
+    async def _async_watchdog_check(self, now: datetime) -> None:
         """Run periodic watchdog evaluation for all robots."""
         _LOGGER.debug("Running periodic watchdog check")
         self.watchdog_checked_at = now.isoformat()
         
         # Sync states for all robots to ensure we have the absolute latest states from HA
-        self.sync_initial_states()
+        storage_changed = self.sync_initial_states()
         
         # Update watchdog metrics for all robots
         for robot_id in self.robots:
             self._update_watchdog_for_robot(robot_id, now)
+            
+        if storage_changed:
+            _LOGGER.debug("Storage changed during watchdog check, scheduling delayed save")
+            self._storage.async_delay_save(self.get_storage_data, 10.0)
             
         # Notify callbacks
         self._notify_callbacks()

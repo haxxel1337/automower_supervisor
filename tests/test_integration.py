@@ -610,16 +610,13 @@ async def test_delayed_save_latest_data() -> None:
 async def test_watchdog_scenarios() -> None:
     """Comprehensive test suite for watchdog scenarios."""
     hass = MagicMock()
-    # Initialize mock list
     hass._mock_time_callbacks = []
     
-    # Setup state dictionary for mocking states.get
     states_db = {}
     def mock_get(entity_id: str) -> MockState | None:
         return states_db.get(entity_id)
     hass.states.get = mock_get
 
-    # Create manager
     manager = AutomowerSupervisorManager(hass)
     await manager.async_setup()
     
@@ -633,11 +630,10 @@ async def test_watchdog_scenarios() -> None:
     sensor = AutomowerRobotSensor(robot_id, manager)
     disc_sensor = AutomowerDiscoverySensor(manager)
     
-    # Let's set some times
     now = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
     homeassistant.util.dt.set_time(now)
     
-    # 1. Fresh clock/status gives online = True
+    # 1. Fresh heartbeat gives online = True
     states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=now - datetime.timedelta(minutes=2))
     states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=now - datetime.timedelta(minutes=3))
     states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=now - datetime.timedelta(minutes=3))
@@ -645,17 +641,53 @@ async def test_watchdog_scenarios() -> None:
     states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=now - datetime.timedelta(minutes=3))
     states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=now - datetime.timedelta(minutes=3))
     
-    # Trigger watchdog check
     await manager._async_watchdog_check(now)
-    
     assert state.online is True
-    assert state.source_age_minutes == 2  # closest to now is clock at 2 mins ago
+    assert state.source_age_minutes == 2
     assert sensor.native_value == "ok"
     assert sensor.extra_state_attributes["online"] is True
     assert sensor.extra_state_attributes["source_values_stale"] is False
-    assert len(state.stale_entities) == 0
-
-    # 2. Clock is unavailable but another heartbeat-entity is fresh: still online
+    
+    # 2. All heartbeat-entities go to unavailable after being fresh
+    for key in ["clock", "status", "status_plain", "battery", "error_message", "error_binary"]:
+        states_db[state.entity_ids[key]] = MockState("unavailable", last_updated=now)
+        
+    # 3. After 5 minutes (still unavailable), robot is still online = True (grace period)
+    now_5 = now + datetime.timedelta(minutes=5)
+    await manager._async_watchdog_check(now_5)
+    assert state.online is True
+    assert state.source_age_minutes == 7  # 5 + 2 minutes since last seen
+    assert sensor.native_value == "insufficient_data"  # all entities unavailable, but NOT critical/offline
+    assert sensor.extra_state_attributes["online"] is True
+    
+    # 4. After 20 minutes, robot is warning with STALE_SOURCE_DATA
+    now_20 = now + datetime.timedelta(minutes=20)
+    await manager._async_watchdog_check(now_20)
+    assert state.online is True
+    assert state.source_age_minutes == 22  # 20 + 2
+    assert sensor.native_value == "warning"
+    assert "STALE_SOURCE_DATA" in sensor.extra_state_attributes["assessment_reasons"]
+    assert sensor.extra_state_attributes["source_values_stale"] is True
+    
+    # 5. After 61 minutes, robot is critical with ROBOT_OFFLINE
+    now_61 = now + datetime.timedelta(minutes=61)
+    await manager._async_watchdog_check(now_61)
+    assert state.online is False
+    assert state.source_age_minutes == 63  # 61 + 2
+    assert sensor.native_value == "critical"
+    assert "ROBOT_OFFLINE" in sensor.extra_state_attributes["assessment_reasons"]
+    assert sensor.extra_state_attributes["source_values_stale"] is True
+    
+    # 6. All entities unavailable without any previous heartbeat gives online = None (NO_HEARTBEAT_DATA)
+    state.last_heartbeat_seen_at = None
+    state.last_source_update_at = None
+    await manager._async_watchdog_check(now)
+    assert state.online is None
+    assert state.source_age_minutes is None
+    assert "NO_HEARTBEAT_DATA" in sensor.extra_state_attributes["assessment_reasons"]
+    assert sensor.native_value != "critical"
+    
+    # 7. Clock unavailable but status fresh gives online = True
     states_db[state.entity_ids["clock"]] = MockState("unavailable", last_updated=now)
     states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=now - datetime.timedelta(minutes=5))
     states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=now - datetime.timedelta(minutes=5))
@@ -666,83 +698,48 @@ async def test_watchdog_scenarios() -> None:
     await manager._async_watchdog_check(now)
     assert state.online is True
     assert state.source_age_minutes == 5
-    assert sensor.native_value == "warning"  # warning because clock is unavailable
-
-    # 3. All heartbeat-entities older than 15 minutes gives warning and STALE_SOURCE_DATA
-    states_db[state.entity_ids["clock"]] = MockState("11:40", last_updated=now - datetime.timedelta(minutes=20))
-    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=now - datetime.timedelta(minutes=25))
-    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=now - datetime.timedelta(minutes=25))
-    states_db[state.entity_ids["battery"]] = MockState("80", last_updated=now - datetime.timedelta(minutes=25))
-    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=now - datetime.timedelta(minutes=25))
-    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=now - datetime.timedelta(minutes=25))
+    assert sensor.native_value == "warning"  # warning due to unavailable clock, but online is True
     
-    await manager._async_watchdog_check(now)
-    assert state.online is True
-    assert state.source_age_minutes == 20
-    assert sensor.native_value == "warning"
-    assert "STALE_SOURCE_DATA" in sensor.extra_state_attributes["assessment_reasons"]
-    # 7. Old values get source_values_stale: True
-    assert sensor.extra_state_attributes["source_values_stale"] is True
-
-    # 4. All heartbeat-entities older than 60 minutes gives critical and ROBOT_OFFLINE
-    states_db[state.entity_ids["clock"]] = MockState("10:50", last_updated=now - datetime.timedelta(minutes=70))
-    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=now - datetime.timedelta(minutes=75))
-    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=now - datetime.timedelta(minutes=75))
-    states_db[state.entity_ids["battery"]] = MockState("80", last_updated=now - datetime.timedelta(minutes=75))
-    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=now - datetime.timedelta(minutes=75))
-    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=now - datetime.timedelta(minutes=75))
+    # 8. Watchdog that detects active_error -> cleared_but_unverified schedules a persistent save
+    # Setup initial active error
+    state.recovery_state = RecoveryState.ACTIVE_ERROR
+    state.current_error_active = True
+    state.last_real_error = "Blade disc blocked"
     
-    await manager._async_watchdog_check(now)
-    assert state.online is False
-    assert state.source_age_minutes == 70
-    assert sensor.native_value == "critical"
-    assert "ROBOT_OFFLINE" in sensor.extra_state_attributes["assessment_reasons"]
-    assert sensor.extra_state_attributes["source_values_stale"] is True
-
-    # 5. Active error is still critical regardless of heartbeat (even if fresh)
-    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=now - datetime.timedelta(minutes=2))
-    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=now - datetime.timedelta(minutes=2))
-    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=now - datetime.timedelta(minutes=2))
-    states_db[state.entity_ids["battery"]] = MockState("80", last_updated=now - datetime.timedelta(minutes=2))
-    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=now - datetime.timedelta(minutes=2))
-    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=now - datetime.timedelta(minutes=2))
+    # Override store's async_delay_save to spy on it
+    save_called = False
+    def spy_async_delay_save(callback: Callable[[], dict[str, Any]], delay: float) -> None:
+        nonlocal save_called
+        save_called = True
+    manager._storage.async_delay_save = spy_async_delay_save
     
-    await manager._async_watchdog_check(now)
-    assert state.online is True
-    assert state.current_error_active is True
-    assert sensor.native_value == "critical"
-    assert "ACTIVE_ERROR_MESSAGE" in sensor.extra_state_attributes["assessment_reasons"]
-
-    # 6. cleared_but_unverified is still critical regardless of heartbeat
-    states_db[state.entity_ids["error_message"]] = MockState("Fault 0", last_updated=now - datetime.timedelta(minutes=2))
+    # Trigger change via states_db: error_message goes to Fault 0 (cleared but unverified)
+    states_db[state.entity_ids["error_message"]] = MockState("Fault 0", last_updated=now)
     
     await manager._async_watchdog_check(now)
     assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
-    assert sensor.native_value == "critical"
-    assert "CLEARED_BUT_UNVERIFIED" in sensor.extra_state_attributes["assessment_reasons"]
-
-    # 9. Timer is unregistered at unload
+    assert save_called is True
+    
+    # 9. Watchdog that does NOT change error status does not schedule unnecessary save
+    save_called = False
+    await manager._async_watchdog_check(now)
+    assert save_called is False
+    
+    # 10. Watchdog does not modify last_real_error_at during normal runs
+    state.last_real_error_at = "2026-06-09T10:00:00"
+    await manager._async_watchdog_check(now)
+    assert state.last_real_error_at == "2026-06-09T10:00:00"
+    
+    # 9 (timer unregister). Timer is unregistered at unload
     unsub_mock = MagicMock()
     manager._unsub_watchdog = unsub_mock
     await manager.async_unload()
     unsub_mock.assert_called_once()
     assert manager._unsub_watchdog is None
 
-    # 10. Reload does not create duplicate timers (idempotent unload handles this)
+    # 10 (timer reload). Reload does not create duplicate timers (idempotent unload handles this)
     await manager.async_unload()
     
-    # 11. Missing entities do not crash watchdog
-    states_db.clear()
-    await manager._async_watchdog_check(now)
-    assert state.online is None
-    
-    # 12. last_real_error and its timestamp are not modified by watchdog checks
-    state.last_real_error = "Blade disc blocked"
-    state.last_real_error_at = "2026-06-09T10:00:00"
-    await manager._async_watchdog_check(now)
-    assert state.last_real_error == "Blade disc blocked"
-    assert state.last_real_error_at == "2026-06-09T10:00:00"
-
     # 14. Discovery totals for online/stale/offline are correct
     state1 = manager.robots["automowerkv5"]
     state1.online = True

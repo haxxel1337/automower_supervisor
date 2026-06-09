@@ -1,4 +1,4 @@
-# Automower Supervisor v0.2.0
+# Automower Supervisor v0.2.1
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
 
@@ -6,9 +6,10 @@ Automower Supervisor is a local Home Assistant custom integration that aggregate
 
 - **Local Event Monitoring**: Listens to existing robotic lawn mower entities directly in Home Assistant without external polling. Push-based updates are processed in real-time.
 - **Periodic Watchdog Check**: A background watchdog runs every 5 minutes (using Home Assistant's `async_track_time_interval`) to check the age of the entity states and detect frozen or stale data without polling any external API or Robonect device.
-- **Offline and Stale Data Detection**:
+- **Offline and Stale Data Detection with Grace Period**:
   - `online` is marked `true` when at least one heartbeat entity has updated within 15 minutes.
-  - `online` is marked `false` when no heartbeat entity has updated within 60 minutes.
+  - If heartbeat entities go `unavailable` or `unknown` temporarily, the watchdog uses a grace period (retaining the online state for up to 60 minutes based on the last observed heartbeat timestamp `last_heartbeat_seen_at`) rather than classifying them offline immediately.
+  - `online` is marked `false` when no heartbeat updates have been seen for more than 60 minutes.
   - If a robot is offline, its state becomes `critical` with reason code `ROBOT_OFFLINE` (and the `source_values_stale` attribute is set to `true`).
   - If updates are older than 15 minutes but <= 60 minutes, the state is `warning` with reason code `STALE_SOURCE_DATA`.
 - **Persistent Error Log**: Real errors are captured and written to local storage using Home Assistant's Store helper.
