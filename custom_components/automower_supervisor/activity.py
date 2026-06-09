@@ -124,19 +124,22 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
         result = result_override
     else:
         mowing_minutes = state.accumulated_mowing_seconds / 60.0
+        recovery_only_allowed = (
+            state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+            and state.last_real_error_category in ("cutting", "other", "none")
+        )
         if mowing_minutes < MOWING_SHORT_MAX_MINUTES:
             result = "short_attempt"
         elif mowing_minutes < RECOVERY_CONFIRM_MIN_MINUTES:
             result = "uncertain_attempt"
         elif mowing_minutes < MOWING_CONFIRM_MIN_MINUTES:
             # 5 to under 10 minutes
-            if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED and has_supporting_activity:
+            if recovery_only_allowed and has_supporting_activity:
                 result = "recovery_confirmation_pending"
+            elif has_supporting_activity:
+                result = "uncertain_attempt"
             else:
-                if has_supporting_activity:
-                    result = "uncertain_attempt"
-                else:
-                    result = "insufficient_supporting_data"
+                result = "insufficient_supporting_data"
         else:
             # 10 minutes or more
             if has_supporting_activity:
@@ -252,12 +255,22 @@ def confirm_pending_mowing(state: RobotState, now: datetime) -> bool:
                 state.failed_recovery = False
                 state.recovery_verified_at = now_utc.isoformat()
     else:  # recovery_only
-        state.last_mowing_attempt_result = "recovery_verified_session"
-        if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-            if state.last_real_error_category in ("cutting", "other", "none"):
-                state.recovery_state = RecoveryState.RECOVERED
-                state.failed_recovery = False
-                state.recovery_verified_at = now_utc.isoformat()
+        if (
+            state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+            and state.last_real_error_category in ("cutting", "other", "none")
+        ):
+            state.last_mowing_attempt_result = "recovery_verified_session"
+            state.recovery_state = RecoveryState.RECOVERED
+            state.failed_recovery = False
+            state.recovery_verified_at = now_utc.isoformat()
+        else:
+            _LOGGER.warning(
+                "Recovery confirmation conditions not met for robot %s (recovery_state: %s, category: %s). Falling back to recovery_confirmation_invalid.",
+                state.robot_id,
+                state.recovery_state,
+                state.last_real_error_category,
+            )
+            state.last_mowing_attempt_result = "recovery_confirmation_invalid"
                 
     clear_pending_confirmation_fields(state)
     return True

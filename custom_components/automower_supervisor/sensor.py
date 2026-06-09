@@ -221,9 +221,17 @@ class AutomowerRobotSensor(SensorEntity):
             
         if state_data.pending_mowing_confirmation:
             reasons.append("PENDING_MOWING_CONFIRMATION")
+            if state_data.pending_confirmation_type == "recovery_only":
+                reasons.append("RECOVERY_CONFIRMATION_PENDING")
+            elif state_data.pending_confirmation_type == "full_mowing":
+                reasons.append("CONFIRMATION_PENDING")
             
         if state_data.last_mowing_attempt_result == "confirmation_pending":
             reasons.append("CONFIRMATION_PENDING")
+        if state_data.last_mowing_attempt_result == "recovery_verified_session":
+            reasons.append("RECOVERY_VERIFIED_SESSION")
+        if state_data.last_mowing_attempt_result == "recovery_confirmation_invalid":
+            reasons.append("RECOVERY_CONFIRMATION_INVALID")
         if state_data.last_mowing_attempt_result == "session_lost_offline":
             reasons.append("MOWING_SESSION_LOST_OFFLINE")
         if state_data.distance_reset_count > 0:

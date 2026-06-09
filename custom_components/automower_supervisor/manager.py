@@ -257,16 +257,30 @@ class AutomowerSupervisorManager:
             state.pending_confirmation_distance_activity = bool(data.get("pending_confirmation_distance_activity", False))
             state.pending_confirmation_runtime_activity = bool(data.get("pending_confirmation_runtime_activity", False))
             state.pending_confirmation_battery_activity = bool(data.get("pending_confirmation_battery_activity", False))
-            state.pending_confirmation_type = data.get("pending_confirmation_type")
-            if state.pending_mowing_confirmation and state.pending_confirmation_type is None:
-                mow_secs = state.pending_confirmation_mowing_seconds
-                if mow_secs >= 600:
+            p_type = data.get("pending_confirmation_type")
+            if state.pending_mowing_confirmation:
+                if p_type is None:
+                    mow_secs = state.pending_confirmation_mowing_seconds
+                    if mow_secs >= 600:
+                        state.pending_confirmation_type = "full_mowing"
+                    elif state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+                        state.pending_confirmation_type = "recovery_only"
+                    else:
+                        _LOGGER.info("Old pending confirmation type not found for robot %s. Falling back to full_mowing.", robot_id)
+                        state.pending_confirmation_type = "full_mowing"
+                    storage_changed = True
+                elif p_type not in ("full_mowing", "recovery_only"):
+                    _LOGGER.warning("Invalid pending confirmation type '%s' for robot %s. Normalizing to full_mowing.", p_type, robot_id)
                     state.pending_confirmation_type = "full_mowing"
-                elif state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-                    state.pending_confirmation_type = "recovery_only"
+                    storage_changed = True
                 else:
-                    _LOGGER.info("Old pending confirmation type not found for robot %s. Falling back to full_mowing.", robot_id)
-                    state.pending_confirmation_type = "full_mowing"
+                    state.pending_confirmation_type = p_type
+            else:
+                if p_type is not None:
+                    state.pending_confirmation_type = None
+                    storage_changed = True
+                else:
+                    state.pending_confirmation_type = None
             
             state.recovery_distance_baseline = data.get("recovery_distance_baseline")
             state.recovery_accumulated_positive_distance = float(data.get("recovery_accumulated_positive_distance", 0.0))

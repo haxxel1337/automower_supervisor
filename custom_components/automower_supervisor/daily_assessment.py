@@ -96,6 +96,24 @@ def get_display_status(state: RobotState) -> str:
     )
 
 
+def is_attempt_from_today(state: RobotState, now: datetime) -> bool:
+    """Return True if the last mowing attempt ended or was attempted today in Europe/Stockholm local time."""
+    time_str = state.last_mowing_ended_at or state.last_mowing_attempt_at
+    if not time_str:
+        return False
+    try:
+        from .schedule import SCHEDULE_TIMEZONE
+        tz = dt_util.get_time_zone(SCHEDULE_TIMEZONE)
+        attempt_dt = datetime.fromisoformat(time_str)
+        if attempt_dt.tzinfo is None:
+            attempt_dt = dt_util.as_utc(attempt_dt)
+        local_attempt = attempt_dt.astimezone(tz) if tz else dt_util.as_local(attempt_dt)
+        local_now = now.astimezone(tz) if tz else dt_util.as_local(now)
+        return local_attempt.date() == local_now.date()
+    except Exception:
+        return False
+
+
 def evaluate_daily_attention(
     state: RobotState,
     now: datetime,
@@ -107,6 +125,7 @@ def evaluate_daily_attention(
     battery_str = format_battery(state.current_battery)
     error_msg = state.last_real_error or "Okänt fel"
     online_suffix = format_online_suffix(state.online)
+    attempt_is_today = is_attempt_from_today(state, now)
 
     # Prepare common offline template text
     if state.online is False:
@@ -117,7 +136,7 @@ def evaluate_daily_attention(
     else:
         offline_text = ""
 
-    # Rule 1: Aktivt eller olöst fel
+    # Rule 1: Aktivt eller olöst fel (always checked, not date-bound)
     is_active_error = (
         state.current_error_active
         or state.binary_error == "on"
@@ -150,7 +169,7 @@ def evaluate_daily_attention(
             )
         return DailyAttentionResult(required=True, state="needs_attention", reason_codes=[code], text=text)
 
-    # Rule 2: Offline
+    # Rule 2: Offline (always checked, not date-bound)
     if state.online is False:
         return DailyAttentionResult(
             required=True,
@@ -159,35 +178,7 @@ def evaluate_daily_attention(
             text=offline_text,
         )
 
-    # Rule 3: Session förlorad offline
-    if state.last_mowing_attempt_result == "session_lost_offline":
-        text = f"{display_name}: Senaste klippsessionen gick förlorad på grund av att roboten gick offline. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["SESSION_LOST_OFFLINE"],
-            text=text,
-        )
-
-    # Rule 4: Fel under eller efter mowing
-    if state.last_mowing_attempt_result == "failed_error_during_mowing":
-        text = f"{display_name}: Fel uppstod under klippning. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["ERROR_DURING_MOWING"],
-            text=text,
-        )
-    if state.last_mowing_attempt_result == "failed_error_after_mowing":
-        text = f"{display_name}: Fel uppstod kort efter klippning. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["ERROR_AFTER_MOWING"],
-            text=text,
-        )
-
-    # Rule 5: Gating before 11:30
+    # Rule 3: Gating before 11:30
     if not daily_check_started(now):
         # Om session pågår
         if state.mowing_session_active:
@@ -217,7 +208,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 6: Aktiv klippsession
+    # Rule 4: Aktiv klippsession
     if state.mowing_session_active:
         text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
         return DailyAttentionResult(
@@ -227,7 +218,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 7: Pending confirmation
+    # Rule 5: Pending confirmation
     if state.pending_mowing_confirmation:
         code = "RECOVERY_CONFIRMATION_PENDING" if state.pending_confirmation_type == "recovery_only" else "MOWING_CONFIRMATION_PENDING"
         text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
@@ -238,7 +229,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 8: Bekräftad klippning idag
+    # Rule 6: Bekräftad klippning idag
     if state.confirmed_mowing_today:
         text = f"{display_name}: Klippning har bekräftats idag."
         return DailyAttentionResult(
@@ -248,7 +239,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 9: Incomplete daily observation guard
+    # Rule 7: Incomplete daily observation guard
     if not observation_complete and not state.mowing_attempted_today:
         text = f"{display_name}: Ofullständig dagsobservation (integrationen startade efter klockan 11:30)."
         return DailyAttentionResult(
@@ -258,8 +249,8 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 10: Ingen start efter 11:30
-    if daily_check_started(now) and not state.mowing_attempted_today:
+    # Rule 8: Ingen start efter 11:30
+    if not state.mowing_attempted_today:
         text = f"{display_name}: Ingen klippsession har registrerats efter klockan 11:00 idag. Aktuell status: {status_str}. {battery_str}. {online_suffix}"
         return DailyAttentionResult(
             required=True,
@@ -268,37 +259,77 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 11: Kort försök
-    if state.last_mowing_attempt_result == "short_attempt":
-        text = f"{display_name}: Roboten gjorde endast ett kort klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)}. Ingen bekräftad klippning har registrerats idag. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["ONLY_SHORT_ATTEMPT"],
-            text=text,
-        )
+    # Rule 9: Dagens specifika attempt-resultat (only if attempt_is_today is True)
+    if attempt_is_today:
+        # Rule 9a: Session förlorad offline
+        if state.last_mowing_attempt_result == "session_lost_offline":
+            text = f"{display_name}: Senaste klippsessionen gick förlorad på grund av att roboten gick offline. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["SESSION_LOST_OFFLINE"],
+                text=text,
+            )
 
-    # Rule 12: Osäkert försök / Insufficient supporting data
-    if state.last_mowing_attempt_result == "uncertain_attempt":
-        text = f"{display_name}: Roboten gjorde ett klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)} men aktiviteten kunde inte bekräftas. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["ONLY_UNCERTAIN_ATTEMPT"],
-            text=text,
-        )
-    if state.last_mowing_attempt_result == "insufficient_supporting_data":
-        text = f"{display_name}: Roboten gjorde ett klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)} men aktiviteten kunde inte bekräftas på grund av otillräcklig data. Aktuell status: {status_str}."
-        return DailyAttentionResult(
-            required=True,
-            state="needs_attention",
-            reason_codes=["NO_CONFIRMED_ACTIVITY"],
-            text=text,
-        )
+        # Rule 9b: Fel under eller efter mowing
+        if state.last_mowing_attempt_result == "failed_error_during_mowing":
+            text = f"{display_name}: Fel uppstod under klippning. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["ERROR_DURING_MOWING"],
+                text=text,
+            )
+        if state.last_mowing_attempt_result == "failed_error_after_mowing":
+            text = f"{display_name}: Fel uppstod kort efter klippning. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["ERROR_AFTER_MOWING"],
+                text=text,
+            )
 
-    # Rule 13: Started but not confirmed
+        # Rule 9c: Kort försök
+        if state.last_mowing_attempt_result == "short_attempt":
+            text = f"{display_name}: Roboten gjorde endast ett kort klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)}. Ingen bekräftad klippning har registrerats idag. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["ONLY_SHORT_ATTEMPT"],
+                text=text,
+            )
+
+        # Rule 9d: Osäkert försök / Insufficient supporting data
+        if state.last_mowing_attempt_result == "uncertain_attempt":
+            text = f"{display_name}: Roboten gjorde ett klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)} men aktiviteten kunde inte bekräftas. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["ONLY_UNCERTAIN_ATTEMPT"],
+                text=text,
+            )
+        if state.last_mowing_attempt_result == "insufficient_supporting_data":
+            text = f"{display_name}: Roboten gjorde ett klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)} men aktiviteten kunde inte bekräftas på grund av otillräcklig data. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["NO_CONFIRMED_ACTIVITY"],
+                text=text,
+            )
+
+        # Rule 9e: Invalid recovery confirmation
+        if state.last_mowing_attempt_result == "recovery_confirmation_invalid":
+            text = f"{display_name}: Roboten gjorde ett klippförsök men återställningsverifieringen misslyckades. Aktuell status: {status_str}."
+            return DailyAttentionResult(
+                required=True,
+                state="needs_attention",
+                reason_codes=["RECOVERY_CONFIRMATION_INVALID"],
+                text=text,
+            )
+
+    # Rule 10: Started but not confirmed
     if state.mowing_attempted_today:
-        if state.last_mowing_attempt_result == "recovery_verified_session":
+        if attempt_is_today and state.last_mowing_attempt_result == "recovery_verified_session":
             text = f"{display_name}: Det tidigare felet \"{error_msg}\" har verifierats återställt efter en klippsession på {format_duration(state.last_mowing_attempt_duration_seconds)}. Dagens fullständiga klippning är ännu inte bekräftad. Aktuell status: {status_str}."
         else:
             text = f"{display_name}: Klippning påbörjades idag men har inte bekräftats. Aktuell status: {status_str}."
