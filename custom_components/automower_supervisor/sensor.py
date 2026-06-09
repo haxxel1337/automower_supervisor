@@ -38,6 +38,9 @@ async def async_setup_entry(
     # Add the central discovery sensor
     entities.append(AutomowerDiscoverySensor(manager))
 
+    # Add the central summary sensor
+    entities.append(AutomowerSupervisorSummarySensor(manager))
+
     async_add_entities(entities)
 
 
@@ -311,7 +314,24 @@ class AutomowerRobotSensor(SensorEntity):
             "failed_recovery": state_data.failed_recovery,
             "recovery_verified_at": state_data.recovery_verified_at,
             "last_real_error_category": state_data.last_real_error_category,
+            # Daily attention
+            "daily_attention_required": state_data.daily_attention_required,
+            "daily_attention_state": state_data.daily_attention_state,
+            "daily_attention_reason_codes": state_data.daily_attention_reason_codes,
+            "daily_attention_text": state_data.daily_attention_text,
+            "daily_attention_evaluated_at": state_data.daily_attention_evaluated_at,
+            "daily_check_started": self._get_daily_check_started(),
+            "daily_schedule_finished": self._get_daily_schedule_finished(),
+            "daily_observation_complete": self.manager.daily_observation_complete,
         }
+
+    def _get_daily_check_started(self) -> bool:
+        from .daily_assessment import daily_check_started
+        return daily_check_started(dt_util.now())
+
+    def _get_daily_schedule_finished(self) -> bool:
+        from .daily_assessment import daily_schedule_finished
+        return daily_schedule_finished(dt_util.now())
 
 
 class AutomowerDiscoverySensor(SensorEntity):
@@ -369,6 +389,12 @@ class AutomowerDiscoverySensor(SensorEntity):
         robots_with_failed_recovery = 0
         robots_with_pending_confirmation = 0
 
+        # Totals for v0.4.0
+        robots_needing_attention = 0
+        robots_monitoring = 0
+        attention_robot_names = []
+        monitoring_robot_names = []
+
         for robot_id, state_data in self.manager.robots.items():
             # Watchdog status counts
             if state_data.online is True:
@@ -394,6 +420,13 @@ class AutomowerDiscoverySensor(SensorEntity):
                 robots_with_failed_recovery += 1
             if state_data.pending_mowing_confirmation:
                 robots_with_pending_confirmation += 1
+
+            if state_data.daily_attention_required:
+                robots_needing_attention += 1
+                attention_robot_names.append(state_data.display_name)
+            elif state_data.daily_attention_state == "monitoring":
+                robots_monitoring += 1
+                monitoring_robot_names.append(state_data.display_name)
 
             found_keys = []
             missing_keys = []
@@ -434,6 +467,10 @@ class AutomowerDiscoverySensor(SensorEntity):
 
         total_found = total_expected - total_missing - total_unavailable - total_unknown
 
+        from .daily_assessment import daily_check_started, daily_schedule_finished
+        daily_check_started_val = daily_check_started(dt_util.now())
+        daily_schedule_finished_val = daily_schedule_finished(dt_util.now())
+
         return {
             "robots_configured": len(self.manager.robots),
             "robots_found": self.native_value,
@@ -452,5 +489,51 @@ class AutomowerDiscoverySensor(SensorEntity):
             "robots_confirmed_mowing_today": robots_confirmed_mowing_today,
             "robots_with_failed_recovery": robots_with_failed_recovery,
             "robots_with_pending_confirmation": robots_with_pending_confirmation,
+            # v0.4.0 metrics
+            "robots_needing_attention": robots_needing_attention,
+            "robots_monitoring": robots_monitoring,
+            "attention_robot_names": attention_robot_names,
+            "monitoring_robot_names": monitoring_robot_names,
+            "daily_check_started": daily_check_started_val,
+            "daily_schedule_finished": daily_schedule_finished_val,
+            "last_daily_evaluation_at": self.manager.daily_attention_summary.get("last_evaluated_at"),
             "robots": robots_dict,
         }
+
+
+class AutomowerSupervisorSummarySensor(SensorEntity):
+    """Exposes summary information about robots needing attention."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Summary"
+    _attr_icon = "mdi:alert-circle-outline"
+    _attr_should_poll = False
+
+    def __init__(self, manager: AutomowerSupervisorManager) -> None:
+        """Initialize the summary sensor."""
+        self.manager = manager
+        self.entity_id = "sensor.automower_supervisor_summary"
+        self._attr_unique_id = "automower_supervisor_summary"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "global")},
+            name="Automower Supervisor",
+            manufacturer="Robonect / Husqvarna",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks when entity is added to Home Assistant."""
+        _LOGGER.debug("Adding summary sensor to hass")
+        self.async_on_remove(
+            self.manager.async_register_callback(self.async_write_ha_state)
+        )
+
+    @property
+    def native_value(self) -> int:
+        """Return the number of robots needing attention."""
+        summary = self.manager.daily_attention_summary
+        return summary.get("attention_count", 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return details about daily attention states."""
+        return self.manager.daily_attention_summary

@@ -1,6 +1,15 @@
-# Automower Supervisor v0.3.5
+# Automower Supervisor v0.4.0
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.4.0
+
+- **Daily Attention Assessment**: Adds rule-based daily attention checking for each robot. It begins evaluation at 11:30 local time and makes a final assessment after 18:05.
+- **Robust Incomplete Observation Handling**: Handles installations or restarts occurring mid-day by avoiding false `DID_NOT_START` warnings. The robot transitions to a `monitoring` state with `INCOMPLETE_DAILY_OBSERVATION` until a full daily cycle has completed.
+- **Summary Attention Sensor**: Registers `sensor.automower_supervisor_summary` which tracks the total count of robots needing attention, lists affected robot IDs/names, and includes a detailed markdown-compatible description.
+- **Deterministic Svenska Text Mallar**: Employs pure deterministic Swedish formatting templates for all warnings, states, and diagnostics. No external LLMs are used.
+- **Separate Sensor and Attention States**: Robots retain their primary sensor states (`ok`, `warning`, `critical`, `insufficient_data`) separate from their `daily_attention_state` (`not_evaluated`, `normal`, `monitoring`, `needs_attention`).
+- **Future Ready**: Google Calendar support is planned for a subsequent release; no calendar API calls are included in this version.
 
 ## Improvements in version 0.3.5
 

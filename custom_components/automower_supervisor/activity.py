@@ -419,5 +419,12 @@ def check_daily_rollover(state: RobotState, now: datetime) -> bool:
         state.daily_date = current_date
         state.confirmed_mowing_today = False
         state.mowing_attempted_today = False
+        
+        # New for 0.4.0
+        state.daily_attention_required = False
+        state.daily_attention_state = "not_evaluated"
+        state.daily_attention_reason_codes = []
+        state.daily_attention_text = None
+        state.daily_attention_evaluated_at = None
         return True
     return False

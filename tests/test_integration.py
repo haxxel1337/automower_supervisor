@@ -801,6 +801,12 @@ async def test_setup_optimizations() -> None:
         save_calls += 1
     manager._storage.async_save = spy_save
     
+    # Initialize daily observation fields to avoid first-run storage_changed=True
+    from custom_components.automower_supervisor.schedule import get_daily_date
+    import homeassistant.util.dt as dt_util
+    manager.daily_observation_started_at = get_daily_date(dt_util.now())
+    manager.daily_tracking_initialized = True
+    
     await manager.async_setup()
     
     # Verify sync_initial_states is called exactly once during setup
@@ -819,6 +825,10 @@ async def test_setup_optimizations() -> None:
             "error_cleared_at": None,
             "current_error_active": True,
             "recovery_state": "active_error",
+        },
+        "_metadata": {
+            "daily_observation_started_at": get_daily_date(dt_util.now()),
+            "daily_tracking_initialized": True,
         }
     }
     
@@ -987,8 +997,8 @@ async def test_watchdog_timezone_calculations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_0_3_5_scenarios() -> None:
-    """Comprehensive tests for version 0.3.5 requirements."""
+async def test_version_0_4_0_scenarios() -> None:
+    """Comprehensive tests for version 0.4.0 requirements."""
     hass = MagicMock()
     hass._mock_time_callbacks = []
     states_db = {}
@@ -1931,6 +1941,341 @@ async def test_version_0_3_5_scenarios() -> None:
     storage_changed_15 = await manager_15._async_load_storage()
     assert storage_changed_15 is True
     assert manager_15.robots["automowerkv5"].last_real_error_category == "cutting"
+
+    # ----------------------------------------------------
+    # Version 0.4.0 Daily Attention Assessment Scenarios
+    # ----------------------------------------------------
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+        daily_check_started,
+        daily_schedule_finished,
+    )
+    from custom_components.automower_supervisor.sensor import AutomowerSupervisorSummarySensor
+    
+    # 1. Före 11:30 flaggas inte frisk sovande robot (not_evaluated/false)
+    t_before = datetime.datetime(2026, 6, 9, 10, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    homeassistant.util.dt.set_time(t_before)
+    state = manager.robots["automowerkv5"]
+    state.mowing_attempted_today = False
+    state.mowing_session_active = False
+    state.confirmed_mowing_today = False
+    state.current_error_active = False
+    state.binary_error = "off"
+    state.recovery_state = RecoveryState.NONE
+    state.failed_recovery = False
+    state.online = True
+    
+    res = evaluate_daily_attention(state, t_before, True)
+    assert res.required is False
+    assert res.state == "not_evaluated"
+    assert "Ännu inte utvärderad" in res.text
+
+    # 2. Aktivt fel flaggas före 11:30 (needs_attention/true/ACTIVE_ERROR)
+    state.current_error_active = True
+    state.last_real_error = "Blade disc blocked"
+    res = evaluate_daily_attention(state, t_before, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ACTIVE_ERROR" in res.reason_codes
+    assert "Aktivt fel" in res.text
+
+    # 3. Cleared but unverified flaggas före 11:30 (needs_attention/true/CLEARED_BUT_UNVERIFIED)
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    res = evaluate_daily_attention(state, t_before, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "CLEARED_BUT_UNVERIFIED" in res.reason_codes
+    assert "är nollställt men inte verifierat" in res.text
+
+    # 4. Offline flaggas före 11:30 (needs_attention/true/ROBOT_OFFLINE)
+    state.recovery_state = RecoveryState.NONE
+    state.online = False
+    state.source_age_minutes = 25
+    state.current_status = "Sleeping"
+    state.current_battery = 24
+    res = evaluate_daily_attention(state, t_before, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ROBOT_OFFLINE" in res.reason_codes
+    assert "Roboten är offline" in res.text
+    
+    # 5. Efter 11:30 flaggas robot som inte startat (needs_attention/true/DID_NOT_START)
+    t_after_1130 = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    homeassistant.util.dt.set_time(t_after_1130)
+    state.online = True
+    state.mowing_attempted_today = False
+    state.confirmed_mowing_today = False
+    state.mowing_session_active = False
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "DID_NOT_START" in res.reason_codes
+    assert "Ingen klippsession har registrerats efter klockan 11:00" in res.text
+
+    # 6. Aktiv mowing efter 11:30 ger monitoring (monitoring/false/MOWING_IN_PROGRESS)
+    state.mowing_session_active = True
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is False
+    assert res.state == "monitoring"
+    assert "MOWING_IN_PROGRESS" in res.reason_codes
+    assert "Klippsession pågår" in res.text
+
+    # 7. Pending confirmation ger monitoring (monitoring/false/MOWING_CONFIRMATION_PENDING)
+    state.mowing_session_active = False
+    state.pending_mowing_confirmation = True
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is False
+    assert res.state == "monitoring"
+    assert "MOWING_CONFIRMATION_PENDING" in res.reason_codes
+
+    # 8. Confirmed mowing today ger normal (normal/false/CONFIRMED_MOWING_TODAY)
+    state.pending_mowing_confirmation = False
+    state.confirmed_mowing_today = True
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is False
+    assert res.state == "normal"
+    assert "CONFIRMED_MOWING_TODAY" in res.reason_codes
+    assert "Klippning har bekräftats idag" in res.text
+
+    # 9. Short attempt ger needs_attention (needs_attention/true/ONLY_SHORT_ATTEMPT)
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = True
+    state.last_mowing_attempt_result = "short_attempt"
+    state.last_mowing_attempt_duration_seconds = 134
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ONLY_SHORT_ATTEMPT" in res.reason_codes
+    assert "kort klippförsök på 2 minuter och 14 sekunder" in res.text
+
+    # 10. Uncertain attempt ger needs_attention (needs_attention/true/ONLY_UNCERTAIN_ATTEMPT)
+    state.last_mowing_attempt_result = "uncertain_attempt"
+    state.last_mowing_attempt_duration_seconds = 420
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ONLY_UNCERTAIN_ATTEMPT" in res.reason_codes
+    assert "klippförsök på 7 minuter men aktiviteten kunde inte bekräftas" in res.text
+
+    # 11. Insufficient supporting data ger needs_attention (needs_attention/true/NO_CONFIRMED_ACTIVITY)
+    state.last_mowing_attempt_result = "insufficient_supporting_data"
+    state.last_mowing_attempt_duration_seconds = 420
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "NO_CONFIRMED_ACTIVITY" in res.reason_codes
+    assert "kunde inte bekräftas på grund av otillräcklig data" in res.text
+
+    # 12. Started but not confirmed ger needs_attention (needs_attention/true/STARTED_BUT_NOT_CONFIRMED)
+    state.last_mowing_attempt_result = None
+    state.mowing_attempted_today = True
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "STARTED_BUT_NOT_CONFIRMED" in res.reason_codes
+    assert "Klippning påbörjades idag men har inte bekräftats" in res.text
+
+    # 13. Failed error during mowing ger needs_attention (needs_attention/true/ERROR_DURING_MOWING)
+    state.last_mowing_attempt_result = "failed_error_during_mowing"
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ERROR_DURING_MOWING" in res.reason_codes
+
+    # 14. Failed error after mowing ger needs_attention (needs_attention/true/ERROR_AFTER_MOWING)
+    state.last_mowing_attempt_result = "failed_error_after_mowing"
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ERROR_AFTER_MOWING" in res.reason_codes
+
+    # 15. Session lost offline ger needs_attention (needs_attention/true/SESSION_LOST_OFFLINE)
+    state.last_mowing_attempt_result = "session_lost_offline"
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "SESSION_LOST_OFFLINE" in res.reason_codes
+
+    # 16. Sleeping efter 18:05 är normal om confirmed mowing finns
+    t_after_1805 = datetime.datetime(2026, 6, 9, 18, 10, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    homeassistant.util.dt.set_time(t_after_1805)
+    state.last_mowing_attempt_result = None
+    state.confirmed_mowing_today = True
+    res = evaluate_daily_attention(state, t_after_1805, True)
+    assert res.required is False
+    assert res.state == "normal"
+
+    # 17. Sleeping efter 18:05 flaggas om ingen bekräftad klippning har registrerats
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = False
+    res = evaluate_daily_attention(state, t_after_1805, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "DID_NOT_START" in res.reason_codes
+
+    # 18. Sleeping efter 18:05 är critical vid cleared_but_unverified
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    res = evaluate_daily_attention(state, t_after_1805, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "CLEARED_BUT_UNVERIFIED" in res.reason_codes
+
+    # Reset state
+    state.recovery_state = RecoveryState.NONE
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = False
+
+    # 19. En robot som återhämtar sig och får confirmed mowing tas bort från summaryn.
+    manager_sum = AutomowerSupervisorManager(hass)
+    from custom_components.automower_supervisor.schedule import get_daily_date
+    manager_sum._storage._store.data = {
+        "_metadata": {
+            "daily_observation_started_at": get_daily_date(t_after_1130),
+            "daily_tracking_initialized": True
+        }
+    }
+    await manager_sum.async_setup()
+    
+    # Initialize other 8 robots as normal/confirmed to isolate the test to Kv5, Sbv14, and Lv9
+    for r_id, r_state in manager_sum.robots.items():
+        if r_id not in ("automowerkv5", "automowersbv14", "automowerlv9"):
+            r_state.confirmed_mowing_today = True
+            
+    # 20. Summary state är korrekt antal.
+    manager_sum.robots["automowersbv14"].online = False
+    manager_sum.robots["automowersbv14"].source_age_minutes = 40
+    manager_sum.robots["automowersbv14"].current_status = "Sleeping"
+    manager_sum.robots["automowersbv14"].current_battery = 43
+    
+    manager_sum.robots["automowerlv9"].online = False
+    manager_sum.robots["automowerlv9"].source_age_minutes = 86
+    manager_sum.robots["automowerlv9"].current_status = "Sleeping"
+    manager_sum.robots["automowerlv9"].current_battery = 24
+    
+    manager_sum.robots["automowerkv5"].online = True
+    manager_sum.robots["automowerkv5"].mowing_attempted_today = False
+    manager_sum.robots["automowerkv5"].confirmed_mowing_today = False
+    
+    # Evaluate at 12:00 so DID_NOT_START triggers for KV5 too
+    manager_sum.evaluate_all_daily_attention(t_after_1130)
+    
+    summary_sensor = AutomowerSupervisorSummarySensor(manager_sum)
+    assert summary_sensor.native_value == 3
+    
+    # 21. Event title innehåller display names i ROBOTS-ordning.
+    assert summary_sensor.extra_state_attributes["event_title"] == "Bot Kv5, Sbv14, Lv9"
+
+    # 22. Event title är null vid noll attention.
+    manager_sum_zero = AutomowerSupervisorManager(hass)
+    await manager_sum_zero.async_setup()
+    manager_sum_zero.evaluate_all_daily_attention(t_before)
+    summary_sensor_zero = AutomowerSupervisorSummarySensor(manager_sum_zero)
+    assert summary_sensor_zero.native_value == 0
+    assert summary_sensor_zero.extra_state_attributes["event_title"] is None
+
+    # 23. Singulartext: `1 robot behöver ses över.`
+    # 24. Pluraltext: `3 robotar behöver ses över.`
+    assert summary_sensor.extra_state_attributes["summary_text"] == "3 robotar behöver ses över."
+    
+    manager_sum_one = AutomowerSupervisorManager(hass)
+    await manager_sum_one.async_setup()
+    manager_sum_one.robots["automowerkv5"].online = False
+    manager_sum_one.robots["automowerkv5"].source_age_minutes = 20
+    manager_sum_one.evaluate_all_daily_attention(t_before)
+    summary_sensor_one = AutomowerSupervisorSummarySensor(manager_sum_one)
+    assert summary_sensor_one.native_value == 1
+    assert summary_sensor_one.extra_state_attributes["summary_text"] == "1 robot behöver ses över."
+
+    # 25. Details innehåller endast attention-required.
+    assert len(summary_sensor.extra_state_attributes["details"]) == 3
+
+    # 26. Monitoring-robotar räknas separat.
+    manager_sum.robots["automoweralmv3"].mowing_session_active = True
+    manager_sum.evaluate_all_daily_attention(t_after_1130)
+    assert "Almv3" in summary_sensor.extra_state_attributes["monitoring_names"]
+    assert summary_sensor.extra_state_attributes["monitoring_count"] == 1
+
+    # 27. Robotsensor visar daily attention-attribut.
+    robot_sensor_kv5 = AutomowerRobotSensor("automowerkv5", manager_sum)
+    assert robot_sensor_kv5.extra_state_attributes["daily_attention_required"] is True
+    assert robot_sensor_kv5.extra_state_attributes["daily_attention_state"] == "needs_attention"
+    assert "DID_NOT_START" in robot_sensor_kv5.extra_state_attributes["daily_attention_reason_codes"]
+    assert robot_sensor_kv5.extra_state_attributes["daily_observation_complete"] is True
+
+    # 28. Discovery-sensor visar totalsiffror.
+    discovery_sensor = AutomowerDiscoverySensor(manager_sum)
+    assert discovery_sensor.extra_state_attributes["robots_needing_attention"] == 3
+    assert discovery_sensor.extra_state_attributes["robots_monitoring"] == 1
+    assert "Kv5" in discovery_sensor.extra_state_attributes["attention_robot_names"]
+
+    # 29. Första installation 15:00 ger INCOMPLETE_DAILY_OBSERVATION, inte DID_NOT_START.
+    manager_first = AutomowerSupervisorManager(hass)
+    t_first_run = datetime.datetime(2026, 6, 9, 15, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+    homeassistant.util.dt.set_time(t_first_run)
+    manager_first._storage._store.data = {}
+    await manager_first.async_setup()
+    assert manager_first.daily_observation_complete is False
+    assert manager_first.robots["automowerkv5"].daily_attention_state == "monitoring"
+    assert "INCOMPLETE_DAILY_OBSERVATION" in manager_first.robots["automowerkv5"].daily_attention_reason_codes
+
+    # 30. Normal restart 15:00 med persistent dagens aktivitet behåller korrekt bedömning.
+    manager_restart = AutomowerSupervisorManager(hass)
+    manager_restart._storage._store.data = {
+        "_metadata": {
+            "daily_observation_started_at": "2026-06-09",
+            "daily_tracking_initialized": True,
+        },
+        "automowerkv5": {
+            "mowing_attempted_today": False,
+            "confirmed_mowing_today": False,
+        }
+    }
+    await manager_restart.async_setup()
+    assert manager_restart.daily_observation_complete is True
+    assert manager_restart.robots["automowerkv5"].daily_attention_state == "needs_attention"
+    assert "DID_NOT_START" in manager_restart.robots["automowerkv5"].daily_attention_reason_codes
+
+    # 31. Nytt datum återställer daily attention.
+    state_kv5 = manager_sum.robots["automowerkv5"]
+    t_next_day = t_after_1130 + datetime.timedelta(days=1)
+    assert state_kv5.daily_attention_required is True
+    from custom_components.automower_supervisor.activity import check_daily_rollover
+    check_daily_rollover(state_kv5, t_next_day)
+    assert state_kv5.daily_attention_required is False
+    assert state_kv5.daily_attention_state == "not_evaluated"
+
+    # 32. Olöst fel överlever daily rollover.
+    state_kv5.current_error_active = True
+    state_kv5.recovery_state = RecoveryState.ACTIVE_ERROR
+    check_daily_rollover(state_kv5, t_next_day)
+    res_rollover_err = evaluate_daily_attention(state_kv5, t_next_day, True)
+    assert res_rollover_err.required is True
+    assert res_rollover_err.state == "needs_attention"
+
+    # 33. Tidszon Europe/Stockholm fungerar vid 11:30 och 18:05.
+    # 34. Daylight saving time hanteras timezone-aware.
+    t_utc_1130_dst = datetime.datetime(2026, 6, 9, 9, 30, 0, tzinfo=datetime.timezone.utc)
+    assert daily_check_started(t_utc_1130_dst) is True
+    
+    t_utc_1805_dst = datetime.datetime(2026, 6, 9, 16, 5, 0, tzinfo=datetime.timezone.utc)
+    assert daily_schedule_finished(t_utc_1805_dst) is True
+
+    # 35. Summary uppdateras vid state event.
+    # 36. Summary uppdateras vid watchdog.
+    # 37. Summary uppdateras när pending blir confirmed.
+    # 38. Summary uppdateras när recovery verifieras.
+    
+    # 39. Storage från 0.3.5 laddas bakåtkompatibelt.
+    manager_compat = AutomowerSupervisorManager(hass)
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "none",
+        }
+    }
+    await manager_compat.async_setup()
+    assert manager_compat.robots["automowerkv5"].last_real_error_category == "cutting"
 
 
 

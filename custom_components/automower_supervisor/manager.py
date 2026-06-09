@@ -114,6 +114,11 @@ class AutomowerSupervisorManager:
         self._unsub_watchdog: Callable[[], None] | None = None
         self.watchdog_checked_at: str | None = None
         
+        # New for 0.4.0
+        self.daily_observation_started_at: str | None = None
+        self.daily_tracking_initialized: bool = False
+        self.daily_attention_summary: dict[str, Any] = {}
+        
         # Initialize the state representation for all robots
         self.robots: dict[str, RobotState] = {}
         for robot_id, display_name in ROBOTS.items():
@@ -150,6 +155,23 @@ class AutomowerSupervisorManager:
         for robot_id in self.robots:
             self._update_watchdog_for_robot(robot_id, now)
             
+        # Determine tracking initialized/observation started today
+        local_date = get_daily_date(now)
+        if self.daily_observation_started_at == local_date:
+            # We already started tracking today before restart, keep the loaded value
+            pass
+        else:
+            self.daily_observation_started_at = local_date
+            from .daily_assessment import daily_check_started
+            if not daily_check_started(now):
+                self.daily_tracking_initialized = True
+            else:
+                self.daily_tracking_initialized = False
+            storage_changed = True
+            
+        # Run daily attention assessment
+        self.evaluate_all_daily_attention(now)
+        
         if storage_changed:
             await self._storage.async_save(self.get_storage_data())
             
@@ -178,7 +200,15 @@ class AutomowerSupervisorManager:
             return False
             
         _LOGGER.debug("Loading persistent storage data: %s", stored_data)
+        
+        # Load daily observation metadata
+        metadata = stored_data.get("_metadata", {}) if isinstance(stored_data, dict) else {}
+        self.daily_observation_started_at = metadata.get("daily_observation_started_at")
+        self.daily_tracking_initialized = bool(metadata.get("daily_tracking_initialized", False))
+
         for robot_id, data in stored_data.items():
+            if robot_id == "_metadata":
+                continue
             if robot_id not in self.robots:
                 continue
             state = self.robots[robot_id]
@@ -237,7 +267,7 @@ class AutomowerSupervisorManager:
 
         return storage_changed
 
-    def get_storage_data(self) -> dict[str, dict[str, Any]]:
+    def get_storage_data(self) -> dict[str, Any]:
         """Return a dictionary of serializable state information to store on disk."""
         data = {}
         for robot_id, state in self.robots.items():
@@ -275,6 +305,10 @@ class AutomowerSupervisorManager:
                 "recovery_previous_distance": state.recovery_previous_distance,
                 "daily_date": state.daily_date,
             }
+        data["_metadata"] = {
+            "daily_observation_started_at": self.daily_observation_started_at,
+            "daily_tracking_initialized": self.daily_tracking_initialized,
+        }
         return data
 
     def sync_initial_states(self, is_startup: bool = False) -> bool:
@@ -418,8 +452,8 @@ class AutomowerSupervisorManager:
             _LOGGER.debug("Data changed for %s, saving/scheduling save to storage", robot_id)
             self._storage.async_delay_save(self.get_storage_data, 10.0)
             
-        # Notify registered UI sensors
-        self._notify_callbacks()
+        # Run daily attention assessment (which also notifies callbacks)
+        self.evaluate_all_daily_attention(now)
 
     def _update_state_field(self, state: RobotState, key: str, value: str | None) -> bool:
         """Update the real-time field based on the entity key. Returns True if storage changed."""
@@ -725,5 +759,121 @@ class AutomowerSupervisorManager:
             _LOGGER.debug("Storage changed during watchdog check, scheduling delayed save")
             self._storage.async_delay_save(self.get_storage_data, 10.0)
             
-        # Notify callbacks
+        # Run daily attention assessment (which also notifies callbacks)
+        self.evaluate_all_daily_attention(now)
+
+    def evaluate_all_daily_attention(self, now: datetime) -> None:
+        """Evaluate daily attention states for all robots and rebuild the summary."""
+        # Calculate daily observation complete flag
+        local_date = get_daily_date(now)
+        
+        # Check if date changed to do manager-level daily rollover tracking
+        if self.daily_observation_started_at != local_date:
+            self.daily_observation_started_at = local_date
+            self.daily_tracking_initialized = True
+            
+        obs_complete = self.daily_observation_complete
+        
+        attention_robots = []
+        monitoring_names = []
+        
+        for robot_id, state in self.robots.items():
+            # Run the rollover check on state too in case it was missed
+            check_daily_rollover(state, now)
+            
+            # Evaluate daily attention
+            from .daily_assessment import evaluate_daily_attention
+            res = evaluate_daily_attention(state, now, obs_complete)
+            
+            # Update state properties
+            state.daily_attention_required = res.required
+            state.daily_attention_state = res.state
+            state.daily_attention_reason_codes = res.reason_codes
+            state.daily_attention_text = res.text
+            state.daily_attention_evaluated_at = now.isoformat()
+            
+            if res.required:
+                attention_robots.append((robot_id, state, res))
+            elif res.state == "monitoring":
+                monitoring_names.append(state.display_name)
+                
+        # Build summary
+        from .const import ROBOTS
+        attention_robots_sorted = []
+        for r_id in ROBOTS:
+            for item in attention_robots:
+                if item[0] == r_id:
+                    attention_robots_sorted.append(item)
+                    break
+                    
+        robot_ids = [item[0] for item in attention_robots_sorted]
+        robot_names = [item[1].display_name for item in attention_robots_sorted]
+        
+        # Event title
+        if robot_names:
+            event_title = "Bot " + ", ".join(robot_names)
+        else:
+            event_title = None
+            
+        # Summary text
+        count = len(robot_names)
+        if count == 0:
+            summary_text = "Alla robotar ser normala ut."
+        elif count == 1:
+            summary_text = "1 robot behöver ses över."
+        else:
+            summary_text = f"{count} robotar behöver ses över."
+            
+        # Details list
+        details = []
+        for r_id, state, res in attention_robots_sorted:
+            code = res.reason_codes[0] if res.reason_codes else ""
+            if code in (
+                "ACTIVE_ERROR",
+                "CLEARED_BUT_UNVERIFIED",
+                "FAILED_RECOVERY",
+                "ROBOT_OFFLINE",
+                "SESSION_LOST_OFFLINE",
+                "ERROR_DURING_MOWING",
+                "ERROR_AFTER_MOWING",
+            ):
+                severity = "critical"
+            else:
+                severity = "warning"
+                
+            details.append({
+                "robot_id": r_id,
+                "display_name": state.display_name,
+                "severity": severity,
+                "daily_attention_state": res.state,
+                "reason_codes": res.reason_codes,
+                "text": res.text,
+            })
+            
+        from .daily_assessment import daily_check_started, daily_schedule_finished
+        
+        self.daily_attention_summary = {
+            "attention_count": count,
+            "robot_ids": robot_ids,
+            "robot_names": robot_names,
+            "event_title": event_title,
+            "summary_text": summary_text,
+            "details": details,
+            "last_evaluated_at": now.isoformat(),
+            "schedule_check_started": daily_check_started(now),
+            "schedule_finished": daily_schedule_finished(now),
+            "monitoring_names": sorted(monitoring_names),
+            "monitoring_count": len(monitoring_names),
+        }
+        
+        # Notify registered UI sensors
         self._notify_callbacks()
+
+    @property
+    def daily_observation_complete(self) -> bool:
+        """Return True if the daily observation is complete for today."""
+        now = dt_util.now()
+        local_date = get_daily_date(now)
+        if self.daily_observation_started_at != local_date:
+            return False
+        return self.daily_tracking_initialized

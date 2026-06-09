@@ -120,3 +120,10 @@ class RobotState:
 
     # Daily state (Persisted)
     daily_date: str | None = None
+
+    # Daily attention tracking (Runtime, not persisted)
+    daily_attention_required: bool = False
+    daily_attention_state: str = "not_evaluated"
+    daily_attention_reason_codes: list[str] = field(default_factory=list)
+    daily_attention_text: str | None = None
+    daily_attention_evaluated_at: str | None = None
