@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import logging
 from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant, Event
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 import homeassistant.util.dt as dt_util
 
 from .const import ROBOTS, ENTITY_PATTERNS, NO_ACTIVE_ERROR_VALUES
@@ -64,6 +65,8 @@ class AutomowerSupervisorManager:
         self._storage = AutomowerSupervisorStorage(hass)
         self._callbacks: list[Callable[[], None]] = []
         self._unsub_listener: Callable[[], None] | None = None
+        self._unsub_watchdog: Callable[[], None] | None = None
+        self.watchdog_checked_at: str | None = None
         
         # Initialize the state representation for all robots
         self.robots: dict[str, RobotState] = {}
@@ -94,8 +97,18 @@ class AutomowerSupervisorManager:
         # Initial scan of current state machine states
         self.sync_initial_states()
         
+        # Watchdog assessment run immediately once
+        await self._async_watchdog_check(dt_util.now())
+        
         # Register listeners
         self.setup_listeners()
+
+        # Register watchdog timer
+        self._unsub_watchdog = async_track_time_interval(
+            self.hass,
+            self._async_watchdog_check,
+            timedelta(minutes=5)
+        )
 
     async def _async_load_storage(self) -> None:
         """Load persistent storage and apply it to the robot states."""
@@ -208,6 +221,9 @@ class AutomowerSupervisorManager:
             _update_entity_state_lists(state, entity_id, None)
             self._update_state_field(state, key, new_state.state)
             
+        # Update watchdog metrics in real-time
+        self._update_watchdog_for_robot(robot_id, dt_util.now())
+            
         # Re-evaluate logic for errors
         storage_changed = self._update_robot_error_state(robot_id, current_time_iso)
         
@@ -309,8 +325,97 @@ class AutomowerSupervisorManager:
                 _LOGGER.error("Error unsubscribing state listener: %s", err)
             self._unsub_listener = None
             
+        if self._unsub_watchdog:
+            try:
+                self._unsub_watchdog()
+            except Exception as err:
+                _LOGGER.error("Error unsubscribing watchdog timer: %s", err)
+            self._unsub_watchdog = None
+            
         # Clear callbacks
         self._callbacks.clear()
             
         # Write storage synchronously/immediately before unload completes
         await self._storage.async_save(self.get_storage_data())
+
+    def _update_watchdog_for_robot(self, robot_id: str, now: datetime.datetime) -> None:
+        """Calculate and update state age/online watchdog metrics for a single robot."""
+        state = self.robots[robot_id]
+        
+        HEARTBEAT_KEYS = [
+            "clock",
+            "status",
+            "status_plain",
+            "battery",
+            "error_message",
+            "error_binary",
+            "distance",
+            "statistic_hours",
+        ]
+        
+        existing_heartbeats = []
+        useful_heartbeats = []
+        
+        for key in HEARTBEAT_KEYS:
+            entity_id = state.entity_ids.get(key)
+            if not entity_id:
+                continue
+            ha_state = self.hass.states.get(entity_id)
+            if ha_state is not None:
+                existing_heartbeats.append(ha_state)
+                if ha_state.state not in ("unavailable", "unknown"):
+                    useful_heartbeats.append((entity_id, ha_state))
+                    
+        state.stale_entities.clear()
+        
+        if not existing_heartbeats:
+            state.online = None
+            state.last_source_update_at = None
+            state.source_age_minutes = None
+        elif not useful_heartbeats:
+            state.online = False
+            state.last_source_update_at = None
+            state.source_age_minutes = None
+        else:
+            # Find latest useful update
+            latest_ha_state = max(useful_heartbeats, key=lambda item: item[1].last_updated)[1]
+            latest_dt = latest_ha_state.last_updated
+            state.last_source_update_at = latest_dt.isoformat()
+            
+            now_naive = now.replace(tzinfo=None) if now.tzinfo is not None else now
+            latest_dt_naive = latest_dt.replace(tzinfo=None) if latest_dt.tzinfo is not None else latest_dt
+            
+            age_delta = now_naive - latest_dt_naive
+            age_min = max(0, int(age_delta.total_seconds() / 60))
+            state.source_age_minutes = age_min
+            
+            # online classification
+            if age_min <= 15:
+                state.online = True
+            elif age_min > 60:
+                state.online = False
+            else:
+                state.online = True  # stale/warning but not definitely offline
+                
+            # Check for individual stale entities (age > 15 minutes)
+            for entity_id, ha_state in useful_heartbeats:
+                ha_updated = ha_state.last_updated
+                ha_updated_naive = ha_updated.replace(tzinfo=None) if ha_updated.tzinfo is not None else ha_updated
+                entity_age = (now_naive - ha_updated_naive).total_seconds() / 60
+                if entity_age > 15:
+                    state.stale_entities.append(entity_id)
+
+    async def _async_watchdog_check(self, now: datetime.datetime) -> None:
+        """Run periodic watchdog evaluation for all robots."""
+        _LOGGER.debug("Running periodic watchdog check")
+        self.watchdog_checked_at = now.isoformat()
+        
+        # Sync states for all robots to ensure we have the absolute latest states from HA
+        self.sync_initial_states()
+        
+        # Update watchdog metrics for all robots
+        for robot_id in self.robots:
+            self._update_watchdog_for_robot(robot_id, now)
+            
+        # Notify callbacks
+        self._notify_callbacks()

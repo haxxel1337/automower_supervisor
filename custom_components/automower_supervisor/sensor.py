@@ -82,8 +82,15 @@ class AutomowerRobotSensor(SensorEntity):
         if is_critical:
             return "critical"
 
-        # 2. Warning / Insufficient Data state
-        # Central keys: status, status_plain, battery, error_message, error_binary, clock
+        # 2. Critical state due to offline (online = False)
+        if state_data.online is False:
+            return "critical"
+
+        # 3. Warning state due to stale data
+        if state_data.online is True and state_data.source_age_minutes is not None and 15 < state_data.source_age_minutes <= 60:
+            return "warning"
+
+        # 4. Warning / Insufficient Data state based on HA entity status
         central_keys = ["status", "status_plain", "battery", "error_message", "error_binary", "clock"]
         
         missing_centrals = [
@@ -130,6 +137,15 @@ class AutomowerRobotSensor(SensorEntity):
             reasons.append("BINARY_ERROR_ON")
         if state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
             reasons.append("CLEARED_BUT_UNVERIFIED")
+
+        # Watchdog status reason codes
+        if state_data.online is False:
+            reasons.append("ROBOT_OFFLINE")
+        elif state_data.online is True and state_data.source_age_minutes is not None and 15 < state_data.source_age_minutes <= 60:
+            reasons.append("STALE_SOURCE_DATA")
+        elif state_data.online is None:
+            reasons.append("NO_HEARTBEAT_DATA")
+
         central_keys = ["status", "status_plain", "battery", "error_message", "error_binary", "clock"]
         missing_centrals = [
             state_data.entity_ids[k] for k in central_keys
@@ -155,6 +171,12 @@ class AutomowerRobotSensor(SensorEntity):
         if available_count < 2:
             reasons.append("INSUFFICIENT_DATA")
 
+        source_values_stale = (
+            state_data.online is False
+            or state_data.online is None
+            or (state_data.source_age_minutes is not None and state_data.source_age_minutes > 15)
+        )
+
         return {
             "robot_id": self.robot_id,
             "display_name": state_data.display_name,
@@ -174,6 +196,12 @@ class AutomowerRobotSensor(SensorEntity):
             "last_event_at": state_data.last_event_at,
             "entity_ids": state_data.entity_ids,
             "assessment_reasons": reasons,
+            "online": state_data.online,
+            "last_source_update_at": state_data.last_source_update_at,
+            "source_age_minutes": state_data.source_age_minutes,
+            "stale_entities": state_data.stale_entities,
+            "watchdog_checked_at": self.manager.watchdog_checked_at,
+            "source_values_stale": source_values_stale,
         }
 
 
@@ -220,8 +248,23 @@ class AutomowerDiscoverySensor(SensorEntity):
         total_missing = 0
         total_unavailable = 0
         total_unknown = 0
+        robots_online = 0
+        robots_stale = 0
+        robots_offline = 0
+        robots_unknown_online_state = 0
 
         for robot_id, state_data in self.manager.robots.items():
+            # Watchdog status counts
+            if state_data.online is True:
+                if state_data.source_age_minutes is not None and state_data.source_age_minutes <= 15:
+                    robots_online += 1
+                else:
+                    robots_stale += 1
+            elif state_data.online is False:
+                robots_offline += 1
+            else:
+                robots_unknown_online_state += 1
+
             found_keys = []
             missing_keys = []
             unavailable_keys = []
@@ -247,6 +290,9 @@ class AutomowerDiscoverySensor(SensorEntity):
                 "missing": missing_keys,
                 "unavailable": unavailable_keys,
                 "unknown": unknown_keys,
+                "online": state_data.online,
+                "source_age_minutes": state_data.source_age_minutes,
+                "last_source_update_at": state_data.last_source_update_at,
             }
 
         total_found = total_expected - total_missing - total_unavailable - total_unknown
@@ -259,5 +305,10 @@ class AutomowerDiscoverySensor(SensorEntity):
             "entities_missing": total_missing,
             "entities_unavailable": total_unavailable,
             "entities_unknown": total_unknown,
+            "robots_online": robots_online,
+            "robots_stale": robots_stale,
+            "robots_offline": robots_offline,
+            "robots_unknown_online_state": robots_unknown_online_state,
+            "watchdog_checked_at": self.manager.watchdog_checked_at,
             "robots": robots_dict,
         }

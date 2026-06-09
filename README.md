@@ -1,10 +1,16 @@
-# Automower Supervisor v0.1.0
+# Automower Supervisor v0.2.0
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
 
-## Features in version 0.1
+## Features in version 0.2
 
-- **Local Event Monitoring**: Listens to existing robotic lawn mower entities directly in Home Assistant without external polling.
+- **Local Event Monitoring**: Listens to existing robotic lawn mower entities directly in Home Assistant without external polling. Push-based updates are processed in real-time.
+- **Periodic Watchdog Check**: A background watchdog runs every 5 minutes (using Home Assistant's `async_track_time_interval`) to check the age of the entity states and detect frozen or stale data without polling any external API or Robonect device.
+- **Offline and Stale Data Detection**:
+  - `online` is marked `true` when at least one heartbeat entity has updated within 15 minutes.
+  - `online` is marked `false` when no heartbeat entity has updated within 60 minutes.
+  - If a robot is offline, its state becomes `critical` with reason code `ROBOT_OFFLINE` (and the `source_values_stale` attribute is set to `true`).
+  - If updates are older than 15 minutes but <= 60 minutes, the state is `warning` with reason code `STALE_SOURCE_DATA`.
 - **Persistent Error Log**: Real errors are captured and written to local storage using Home Assistant's Store helper.
 - **Fault Retention**: An error is marked as `cleared_but_unverified` when the mower reports `Fault 0` or goes `off`. It remains in a `critical` assessment state until a future version adds automated verification.
 - **Config Flow Setup**: Setup is easily initiated via the Home Assistant UI (Settings -> Devices & Services).
@@ -22,7 +28,7 @@ Automower Supervisor is a local Home Assistant custom integration that aggregate
   - `automowerlv9` (Lv9)
 - **Central Discovery Sensor**: A summary sensor (`sensor.automower_supervisor_discovery`) details the overall integration status and the configuration of expected vs missing/unavailable entities.
 
-## What is NOT included in version 0.1
+## What is NOT included in version 0.2
 
 - No external API/MQTT/REST client connection.
 - No Google Calendar integration.

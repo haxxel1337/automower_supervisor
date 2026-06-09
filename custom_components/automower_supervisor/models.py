@@ -42,3 +42,9 @@ class RobotState:
     
     # Event metadata
     last_event_at: str | None = None
+
+    # Watchdog state age tracking fields
+    last_source_update_at: str | None = None
+    source_age_minutes: int | None = None
+    online: bool | None = None
+    stale_entities: list[str] = field(default_factory=list)
