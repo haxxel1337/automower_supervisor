@@ -15,11 +15,29 @@ import homeassistant.util.dt as dt_util
 
 from .const import DOMAIN, NO_ACTIVE_ERROR_VALUES
 from .manager import AutomowerSupervisorManager, get_robot_suffix
-from .models import RecoveryState
+from .models import RecoveryState, RobotState
 from .schedule import is_scheduled_now
 from .daily_assessment import is_attempt_from_today
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _append_pending_reason_codes(
+    reasons: list[str],
+    state_data: RobotState,
+) -> None:
+    """Append pending reason codes based on active pending mowing confirmation status."""
+    if not state_data.pending_mowing_confirmation:
+        return
+
+    reasons.append("PENDING_MOWING_CONFIRMATION")
+
+    if state_data.pending_confirmation_type == "full_mowing":
+        reasons.append("CONFIRMATION_PENDING")
+    elif state_data.pending_confirmation_type == "recovery_only":
+        reasons.append("RECOVERY_CONFIRMATION_PENDING")
+    else:
+        reasons.append("PENDING_CONFIRMATION_TYPE_INVALID")
 
 
 async def async_setup_entry(
@@ -248,15 +266,7 @@ class AutomowerRobotSensor(SensorEntity):
         if state_data.recovery_state == RecoveryState.RECOVERED:
             reasons.append("RECOVERY_VERIFIED")
             
-        if state_data.pending_mowing_confirmation:
-            reasons.append("PENDING_MOWING_CONFIRMATION")
-            if state_data.pending_confirmation_type == "recovery_only":
-                reasons.append("RECOVERY_CONFIRMATION_PENDING")
-            elif state_data.pending_confirmation_type == "full_mowing":
-                reasons.append("CONFIRMATION_PENDING")
-            
-        if state_data.last_mowing_attempt_result == "confirmation_pending":
-            reasons.append("CONFIRMATION_PENDING")
+        _append_pending_reason_codes(reasons, state_data)
         if state_data.distance_reset_count > 0:
             reasons.append("DISTANCE_RESET_DETECTED")
         if state_data.interruption_status is not None:

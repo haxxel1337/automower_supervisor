@@ -3167,6 +3167,171 @@ async def test_version_0_4_3_scenarios() -> None:
     assert sensor.extra_state_attributes["last_attempt_is_today"] is False
 
 
+@pytest.mark.asyncio
+async def test_version_0_4_4_scenarios() -> None:
+    """Comprehensive tests for version 0.4.4 requirements."""
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    states_db = {}
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    
+    # Base timestamp: 2026-06-09 12:00:00 UTC (14:00:00 Stockholm)
+    t_today = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    t_yesterday = t_today - datetime.timedelta(days=1)
+    homeassistant.util.dt.set_time(t_today)
+    
+    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=t_today)
+    states_db[state.entity_ids["status"]] = MockState("Sleeping", last_updated=t_today)
+    states_db[state.entity_ids["status_plain"]] = MockState("sleeping", last_updated=t_today)
+    states_db[state.entity_ids["battery"]] = MockState("100", last_updated=t_today)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=t_today)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=t_today)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=t_today)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=t_today)
+    
+    manager.sync_initial_states()
+    
+    # 1. last_mowing_attempt_result = confirmation_pending och pending false ger ingen CONFIRMATION_PENDING.
+    state.last_mowing_attempt_result = "confirmation_pending"
+    state.last_mowing_ended_at = t_today.isoformat()
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_type = None
+    assert "CONFIRMATION_PENDING" not in sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 2. last_mowing_attempt_result = recovery_confirmation_pending och pending false ger ingen RECOVERY_CONFIRMATION_PENDING.
+    state.last_mowing_attempt_result = "recovery_confirmation_pending"
+    state.last_mowing_ended_at = t_today.isoformat()
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_type = None
+    assert "RECOVERY_CONFIRMATION_PENDING" not in sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 3. Pending true + type full_mowing ger: PENDING_MOWING_CONFIRMATION and CONFIRMATION_PENDING
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = "full_mowing"
+    state.last_mowing_attempt_result = "confirmation_pending"
+    reasons = sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" in reasons
+    assert "CONFIRMATION_PENDING" in reasons
+    assert reasons.count("CONFIRMATION_PENDING") == 1  # 19. Ingen duplicate CONFIRMATION_PENDING
+    
+    # 4. Pending true + type recovery_only ger: PENDING_MOWING_CONFIRMATION and RECOVERY_CONFIRMATION_PENDING
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = "recovery_only"
+    state.last_mowing_attempt_result = "recovery_confirmation_pending"
+    reasons = sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" in reasons
+    assert "RECOVERY_CONFIRMATION_PENDING" in reasons
+    assert reasons.count("RECOVERY_CONFIRMATION_PENDING") == 1  # 20. Ingen duplicate RECOVERY_CONFIRMATION_PENDING
+    
+    # 5. Pending true + type null ger: PENDING_MOWING_CONFIRMATION and PENDING_CONFIRMATION_TYPE_INVALID
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = None
+    reasons = sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" in reasons
+    assert "PENDING_CONFIRMATION_TYPE_INVALID" in reasons
+    assert "CONFIRMATION_PENDING" not in reasons
+    assert "RECOVERY_CONFIRMATION_PENDING" not in reasons
+    
+    # 6. Pending true + type ogiltigt värde ger invalid reason.
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = "invalid_type"
+    reasons = sensor.extra_state_attributes["assessment_reasons"]
+    assert "PENDING_MOWING_CONFIRMATION" in reasons
+    assert "PENDING_CONFIRMATION_TYPE_INVALID" in reasons
+    assert "CONFIRMATION_PENDING" not in reasons
+    assert "RECOVERY_CONFIRMATION_PENDING" not in reasons
+    
+    # Reset pending state
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_type = None
+    
+    # 7. Pending false + gammalt confirmation_pending-resultat påverkar inte native_value.
+    state.last_mowing_attempt_result = "confirmation_pending"
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "ok"
+    
+    # 8. Pending false + gammalt recovery_confirmation_pending-resultat påverkar inte native_value.
+    state.last_mowing_attempt_result = "recovery_confirmation_pending"
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "ok"
+    
+    # 9. Dagens confirmed_mowing visar CONFIRMED_MOWING.
+    state.last_mowing_attempt_result = "confirmed_mowing"
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "CONFIRMED_MOWING" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 10. Gårdagens confirmed_mowing filtreras fortfarande bort enligt 0.4.3.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "CONFIRMED_MOWING" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 11. Dagens recovery_verified_session visar RECOVERY_VERIFIED_SESSION.
+    state.last_mowing_attempt_result = "recovery_verified_session"
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "RECOVERY_VERIFIED_SESSION" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 12. Gårdagens recovery_verified_session filtreras bort.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "RECOVERY_VERIFIED_SESSION" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 13. Active error fungerar oförändrat.
+    state.current_error_active = True
+    assert sensor.native_value == "critical"
+    state.current_error_active = False
+    
+    # 14. Cleared but unverified fungerar oförändrat.
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    assert sensor.native_value == "critical"
+    state.recovery_state = RecoveryState.NONE
+    
+    # 15. Offline fungerar oförändrat.
+    state.online = False
+    assert sensor.native_value == "critical"
+    state.online = True
+    
+    # 16. Daily summary fungerar oförändrat.
+    from custom_components.automower_supervisor.sensor import AutomowerSupervisorSummarySensor
+    summary_sensor = AutomowerSupervisorSummarySensor(manager)
+    assert summary_sensor.native_value is not None
+    
+    # 17. Storage-load normaliserar saknad pending type.
+    manager_compat = AutomowerSupervisorManager(hass)
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": "2026-06-09T10:00:00",
+            "pending_confirmation_mowing_seconds": 600,
+        }
+    }
+    storage_changed = await manager_compat._async_load_storage()
+    assert storage_changed is True
+    assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "full_mowing"
+    
+    # 18. Storage-load normaliserar ogiltig pending type.
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": "2026-06-09T10:00:00",
+            "pending_confirmation_mowing_seconds": 300,
+            "pending_confirmation_type": "ogiltig",
+        }
+    }
+    storage_changed = await manager_compat._async_load_storage()
+    assert storage_changed is True
+    assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "full_mowing"
+
+
+
 
 
 
