@@ -1,10 +1,18 @@
-# Automower Supervisor v0.3.0
+# Automower Supervisor v0.3.1
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
 
+## Improvements in version 0.3.1
+
+- **Long-Running Temporary Statuses**: Normal `Searching` and `Detecting status` states now keep the active mowing session open indefinitely without any timeout, only pausing active mowing time accumulation.
+- **Definitive Terminating Statuses**: Explicit terminating states like `Searching for charging station` immediately end the session.
+- **Resilient Distance delta tracking**: Handles distance sensor resets (e.g. going from 40 to 0) by accumulating only positive deltas, ensuring that resets do not falsely indicate lack of movement or break recovery verification.
+- **Separated Pending Confirmations**: Multiple sessions are now confirmed/failed independently. Starting a new mowing session while a previous session is in its 5-minute grace period no longer overrides or clears the pending confirmation candidate.
+- **Graceful Unknown Status Fallback**: Okända/icke-kartlagda statusar avslutar inte längre sessionen omedelbart; de sätter bara sessionen i ett tillfälligt pausat/osäkert läge.
+
 ## Features in version 0.3
 
-- **Mowing Session Tracking**: Registers cohesive mowing sessions. Distinguishes short startup attempts (faktiska klippförsök < 3 min) from real mowing, and handles short status interruptions (e.g., `Searching` or `Detecting status`) up to 10 minutes without breaking the session.
+- **Mowing Session Tracking**: Registers cohesive mowing sessions. Distinguishes short startup attempts (faktiska klippförsök < 3 min) from real mowing.
 - **Mowing Confirmation & Grace Period**: Evaluates session validity upon termination. Sessions of >= 10 minutes require supporting data (battery drop >= 2, distance delta >= 1.0, or runtime hours delta >= 0.01) to enter a 5-minute confirmation grace period. After 5 minutes without new errors, it is classified as `confirmed_mowing`.
 - **Verified Recovery Logic**: Automated verification to recover from previous errors:
   - *Movement errors* (e.g. "No traction") transition from `cleared_but_unverified` to `recovered` immediately upon a distance increase of >= 1.0.

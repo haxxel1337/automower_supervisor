@@ -113,7 +113,7 @@ class AutomowerRobotSensor(SensorEntity):
             return "insufficient_data"
 
         # 4. Warning state due to uncertain mowing session attempts
-        if state_data.last_mowing_attempt_result in ("uncertain_attempt", "interrupted_searching"):
+        if state_data.last_mowing_attempt_result in ("uncertain_attempt", "interrupted_searching", "session_lost_offline"):
             return "warning"
 
         # 5. Warning state if schedule active, attempted but not confirmed today
@@ -218,6 +218,17 @@ class AutomowerRobotSensor(SensorEntity):
             
         if state_data.pending_mowing_confirmation:
             reasons.append("PENDING_MOWING_CONFIRMATION")
+            
+        if state_data.last_mowing_attempt_result == "confirmation_pending":
+            reasons.append("CONFIRMATION_PENDING")
+        if state_data.last_mowing_attempt_result == "session_lost_offline":
+            reasons.append("MOWING_SESSION_LOST_OFFLINE")
+        if state_data.distance_reset_count > 0:
+            reasons.append("DISTANCE_RESET_DETECTED")
+        if state_data.interruption_status is not None:
+            norm_status = state_data.interruption_status.strip().lower()
+            if norm_status not in ("searching", "detecting status", "unknown"):
+                reasons.append("UNKNOWN_SESSION_STATUS")
 
         # Deduplicate reasons list
         unique_reasons = []
@@ -271,6 +282,15 @@ class AutomowerRobotSensor(SensorEntity):
             "interruption_started_at": state_data.interruption_started_at,
             "interruption_status": state_data.interruption_status,
             "pending_session_end": state_data.pending_session_end,
+            "session_accumulated_positive_distance": state_data.session_accumulated_positive_distance,
+            "session_distance_activity_detected": state_data.session_distance_activity_detected,
+            "pending_confirmation_ended_at": state_data.pending_confirmation_ended_at,
+            "pending_confirmation_mowing_seconds": state_data.pending_confirmation_mowing_seconds,
+            "pending_confirmation_session_elapsed_seconds": state_data.pending_confirmation_session_elapsed_seconds,
+            "pending_confirmation_distance_activity": state_data.pending_confirmation_distance_activity,
+            "pending_confirmation_runtime_activity": state_data.pending_confirmation_runtime_activity,
+            "pending_confirmation_battery_activity": state_data.pending_confirmation_battery_activity,
+            "distance_reset_count": state_data.distance_reset_count,
             # Last Attempt / Confirmed
             "last_mowing_attempt_at": state_data.last_mowing_attempt_at,
             "last_mowing_attempt_duration_seconds": state_data.last_mowing_attempt_duration_seconds,

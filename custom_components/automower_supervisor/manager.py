@@ -22,6 +22,7 @@ from .activity import (
     check_pending_mowing_confirmation,
     handle_status_change,
     check_daily_rollover,
+    update_robot_distance,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -164,6 +165,19 @@ class AutomowerSupervisorManager:
             state.failed_recovery = bool(data.get("failed_recovery", False))
             state.recovery_verified_at = data.get("recovery_verified_at")
             state.last_real_error_category = data.get("last_real_error_category", "none")
+            
+            state.pending_mowing_confirmation = bool(data.get("pending_mowing_confirmation", False))
+            state.pending_confirmation_ended_at = data.get("pending_confirmation_ended_at")
+            state.pending_confirmation_mowing_seconds = int(data.get("pending_confirmation_mowing_seconds", 0))
+            state.pending_confirmation_session_elapsed_seconds = int(data.get("pending_confirmation_session_elapsed_seconds", 0))
+            state.pending_confirmation_distance_activity = bool(data.get("pending_confirmation_distance_activity", False))
+            state.pending_confirmation_runtime_activity = bool(data.get("pending_confirmation_runtime_activity", False))
+            state.pending_confirmation_battery_activity = bool(data.get("pending_confirmation_battery_activity", False))
+            
+            state.recovery_distance_baseline = data.get("recovery_distance_baseline")
+            state.recovery_accumulated_positive_distance = float(data.get("recovery_accumulated_positive_distance", 0.0))
+            state.recovery_previous_distance = data.get("recovery_previous_distance")
+            
             if "daily_date" in data and data["daily_date"] is not None:
                 state.daily_date = data["daily_date"]
 
@@ -193,6 +207,16 @@ class AutomowerSupervisorManager:
                 "failed_recovery": state.failed_recovery,
                 "recovery_verified_at": state.recovery_verified_at,
                 "last_real_error_category": state.last_real_error_category,
+                "pending_mowing_confirmation": state.pending_mowing_confirmation,
+                "pending_confirmation_ended_at": state.pending_confirmation_ended_at,
+                "pending_confirmation_mowing_seconds": state.pending_confirmation_mowing_seconds,
+                "pending_confirmation_session_elapsed_seconds": state.pending_confirmation_session_elapsed_seconds,
+                "pending_confirmation_distance_activity": state.pending_confirmation_distance_activity,
+                "pending_confirmation_runtime_activity": state.pending_confirmation_runtime_activity,
+                "pending_confirmation_battery_activity": state.pending_confirmation_battery_activity,
+                "recovery_distance_baseline": state.recovery_distance_baseline,
+                "recovery_accumulated_positive_distance": state.recovery_accumulated_positive_distance,
+                "recovery_previous_distance": state.recovery_previous_distance,
                 "daily_date": state.daily_date,
             }
         return data
@@ -232,6 +256,11 @@ class AutomowerSupervisorManager:
             # Evaluate error state after initial loading
             if self._update_robot_error_state(robot_id, current_time_iso):
                 storage_changed = True
+
+            # Check pending mowing confirmation
+            if state.pending_mowing_confirmation:
+                if check_pending_mowing_confirmation(state, now):
+                    storage_changed = True
 
             # Handle HA restart during Mowing
             if is_startup:
@@ -322,9 +351,7 @@ class AutomowerSupervisorManager:
                 
         # If status changed, handle session state machine
         if key in ("status_plain", "status"):
-            status_val = state.current_status_plain
-            if not status_val:
-                status_val = state.current_status
+            status_val = state.current_status or state.current_status_plain
             if handle_status_change(state, status_val, now):
                 storage_changed = True
                 
@@ -363,29 +390,9 @@ class AutomowerSupervisorManager:
             if value == "on":
                 if state.mowing_session_active:
                     state.session_binary_error_detected = True
-                if state.pending_mowing_confirmation:
-                    state.pending_mowing_confirmation = False
-                    state.last_mowing_attempt_result = "failed_error_after_mowing"
-                    state.failed_recovery = True
-                    storage_changed = True
         elif key == "distance":
             val_float = safe_float(value)
-            if state.mowing_session_active:
-                state.session_latest_distance = val_float
-                if state.session_start_distance is None:
-                    state.session_start_distance = val_float
-            if val_float is not None and val_float != state.last_distance_value:
-                # If in cleared but unverified and category is movement, check delta for recovery
-                if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED and state.last_real_error_category == "movement":
-                    if state.last_distance_value is not None:
-                        delta = val_float - state.last_distance_value
-                        if delta >= 1.0:
-                            state.recovery_state = RecoveryState.RECOVERED
-                            state.failed_recovery = False
-                            state.recovery_verified_at = dt_util.as_utc(dt_util.now()).isoformat()
-                            storage_changed = True
-                state.last_distance_value = val_float
-                state.last_distance_change_at = dt_util.as_utc(dt_util.now()).isoformat()
+            if update_robot_distance(state, val_float):
                 storage_changed = True
         elif key == "statistic_hours":
             val_float = safe_float(value)
@@ -450,6 +457,12 @@ class AutomowerSupervisorManager:
                 state.pending_mowing_confirmation = False
                 state.last_mowing_attempt_result = "failed_error_after_mowing"
                 state.failed_recovery = True
+                state.pending_confirmation_ended_at = None
+                state.pending_confirmation_mowing_seconds = 0
+                state.pending_confirmation_session_elapsed_seconds = 0
+                state.pending_confirmation_distance_activity = False
+                state.pending_confirmation_runtime_activity = False
+                state.pending_confirmation_battery_activity = False
                 changed = True
         else:
             # No active error reported by sensors
@@ -457,6 +470,12 @@ class AutomowerSupervisorManager:
                 state.current_error_active = False
                 state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
                 state.error_cleared_at = current_time_iso
+                
+                # Initialize recovery distance tracking
+                state.recovery_distance_baseline = state.last_distance_value
+                state.recovery_previous_distance = state.last_distance_value
+                state.recovery_accumulated_positive_distance = 0.0
+                
                 changed = True
             else:
                 # Keep cleared_but_unverified state. Ensure current_error_active is sync'd to False.
@@ -611,31 +630,26 @@ class AutomowerSupervisorManager:
                 update_accumulated_mowing_time(state, now)
                 update_session_latest_values(state)
                 
-                # Check interruption grace period
-                if state.pending_session_end and state.interruption_started_at:
-                    int_start = datetime.fromisoformat(state.interruption_started_at)
-                    int_start_utc = dt_util.as_utc(int_start)
-                    now_utc = dt_util.as_utc(now)
-                    int_duration = (now_utc - int_start_utc).total_seconds()
-                    if int_duration > 600: # 10 minutes
-                        if end_mowing_session(state, now, "interrupted_searching"):
+                # Safeguard: if robot goes offline, end session
+                if state.online is False:
+                    if end_mowing_session(state, now, "session_lost_offline"):
+                        storage_changed = True
+                else:
+                    # Safeguard: if session is active but current status is terminating
+                    status_norm = (state.current_status_plain or "").strip().lower()
+                    if not status_norm and state.current_status:
+                        status_norm = state.current_status.strip().lower()
+                        
+                    terminating_statuses = {
+                        "error", "fault", "charging", "sleeping", "parked", 
+                        "way home", "searching for charging station", "stopped", "off"
+                    }
+                    if status_norm in terminating_statuses:
+                        if status_norm in ("error", "fault"):
+                            state.session_error_detected = True
+                        if end_mowing_session(state, now):
                             storage_changed = True
                             
-                # Safeguard: if session is active but current status is terminating
-                status_norm = (state.current_status_plain or "").strip().lower()
-                if not status_norm and state.current_status:
-                    status_norm = state.current_status.strip().lower()
-                    
-                terminating_statuses = {
-                    "error", "fault", "charging", "sleeping", "parked", 
-                    "way home", "searching for charging station", "stopped", "off"
-                }
-                if status_norm in terminating_statuses:
-                    if status_norm in ("error", "fault"):
-                        state.session_error_detected = True
-                    if end_mowing_session(state, now):
-                        storage_changed = True
-                        
             # Check pending confirmation 5 minutes timeout
             if state.pending_mowing_confirmation:
                 if check_pending_mowing_confirmation(state, now):

@@ -9,6 +9,14 @@ import homeassistant.util.dt as dt_util
 
 from .models import RobotState, RecoveryState
 from .schedule import get_daily_date
+from .const import (
+    MOWING_SHORT_MAX_MINUTES,
+    MOWING_CONFIRM_MIN_MINUTES,
+    ERROR_GRACE_PERIOD_MINUTES,
+    DISTANCE_MIN_DELTA_METERS,
+    RUNTIME_MIN_DELTA_HOURS,
+    BATTERY_MIN_DROP_PERCENT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +92,8 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
     update_accumulated_mowing_time(state, now)
     update_session_latest_values(state)
     
+    now_utc = dt_util.as_utc(now)
+    
     # Classify session result
     if state.session_error_detected or state.session_binary_error_detected:
         result = "failed_error_during_mowing"
@@ -91,57 +101,59 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
         result = result_override
     else:
         mowing_minutes = state.accumulated_mowing_seconds / 60.0
-        if mowing_minutes < 3.0:
+        if mowing_minutes < MOWING_SHORT_MAX_MINUTES:
             result = "short_attempt"
-        elif mowing_minutes < 10.0:
+        elif mowing_minutes < MOWING_CONFIRM_MIN_MINUTES:
             result = "uncertain_attempt"
         else:
-            result = "confirmation_candidate"
+            result = "confirmation_pending"
             
     # Save last attempt data
     state.last_mowing_attempt_at = state.session_started_at
     state.last_mowing_attempt_duration_seconds = state.accumulated_mowing_seconds
     state.last_mowing_session_elapsed_seconds = state.session_elapsed_seconds
-    state.last_mowing_attempt_result = result
-    state.last_mowing_ended_at = dt_util.as_utc(now).isoformat()
+    state.last_mowing_ended_at = now_utc.isoformat()
     
     storage_changed = True
     
-    # Candidate evaluation
-    if result == "confirmation_candidate":
-        # Check supporting signals:
-        # Distance delta >= 1.0
-        has_distance_signal = False
-        if (state.session_start_distance is not None and 
-            state.session_latest_distance is not None):
-            delta = state.session_latest_distance - state.session_start_distance
-            if delta >= 1.0:
-                has_distance_signal = True
-                
-        # Runtime delta >= 0.01
+    if result == "confirmation_pending":
+        # Check supporting signals
+        has_distance_signal = (
+            state.session_accumulated_positive_distance >= DISTANCE_MIN_DELTA_METERS
+            or state.session_distance_activity_detected
+        )
+        
         has_runtime_signal = False
         if (state.session_start_runtime_hours is not None and 
             state.session_latest_runtime_hours is not None):
             delta = state.session_latest_runtime_hours - state.session_start_runtime_hours
-            if delta >= 0.01:
+            if delta >= RUNTIME_MIN_DELTA_HOURS:
                 has_runtime_signal = True
                 
-        # Battery drop >= 2
         has_battery_signal = False
         if (state.session_start_battery is not None and 
             state.session_latest_battery is not None):
             delta = state.session_start_battery - state.session_latest_battery
-            if delta >= 2:
+            if delta >= BATTERY_MIN_DROP_PERCENT:
                 has_battery_signal = True
                 
         if has_distance_signal or has_runtime_signal or has_battery_signal:
             state.pending_mowing_confirmation = True
+            state.pending_confirmation_ended_at = now_utc.isoformat()
+            state.pending_confirmation_mowing_seconds = state.accumulated_mowing_seconds
+            state.pending_confirmation_session_elapsed_seconds = state.session_elapsed_seconds
+            state.pending_confirmation_distance_activity = has_distance_signal
+            state.pending_confirmation_runtime_activity = has_runtime_signal
+            state.pending_confirmation_battery_activity = has_battery_signal
+            state.last_mowing_attempt_result = "confirmation_pending"
         else:
             state.last_mowing_attempt_result = "insufficient_supporting_data"
-    elif result == "failed_error_during_mowing":
-        if state.recovery_state in (RecoveryState.CLEARED_BUT_UNVERIFIED, RecoveryState.ACTIVE_ERROR):
-            state.failed_recovery = True
-            
+    else:
+        state.last_mowing_attempt_result = result
+        if result == "failed_error_during_mowing":
+            if state.recovery_state in (RecoveryState.CLEARED_BUT_UNVERIFIED, RecoveryState.ACTIVE_ERROR):
+                state.failed_recovery = True
+                
     # Clear active session fields
     state.mowing_session_active = False
     state.session_started_at = None
@@ -161,25 +173,30 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
     state.session_error_detected = False
     state.session_binary_error_detected = False
     
+    state.session_previous_distance = None
+    state.session_accumulated_positive_distance = 0.0
+    state.session_distance_activity_detected = False
+    state.distance_reset_count = 0
+    
     return storage_changed
 
 
 def check_pending_mowing_confirmation(state: RobotState, now: datetime) -> bool:
     """Check if the 5-minute grace period has passed for a pending mowing confirmation. Returns True if storage changed."""
-    if not state.pending_mowing_confirmation or not state.last_mowing_ended_at:
+    if not state.pending_mowing_confirmation or not state.pending_confirmation_ended_at:
         return False
         
     try:
-        ended_at = datetime.fromisoformat(state.last_mowing_ended_at)
+        ended_at = datetime.fromisoformat(state.pending_confirmation_ended_at)
         now_utc = dt_util.as_utc(now)
         ended_at_utc = dt_util.as_utc(ended_at)
         elapsed = (now_utc - ended_at_utc).total_seconds()
         
-        if elapsed >= 300:  # 5 minutes
+        if elapsed >= ERROR_GRACE_PERIOD_MINUTES * 60:
             state.pending_mowing_confirmation = False
             state.last_mowing_attempt_result = "confirmed_mowing"
-            state.last_confirmed_mowing_at = state.last_mowing_ended_at
-            state.last_confirmed_mowing_duration_seconds = state.last_mowing_attempt_duration_seconds
+            state.last_confirmed_mowing_at = state.pending_confirmation_ended_at
+            state.last_confirmed_mowing_duration_seconds = state.pending_confirmation_mowing_seconds
             state.confirmed_mowing_today = True
             
             # Verify recovery if cleared but unverified and error category is cutting, other, or none
@@ -188,6 +205,14 @@ def check_pending_mowing_confirmation(state: RobotState, now: datetime) -> bool:
                     state.recovery_state = RecoveryState.RECOVERED
                     state.failed_recovery = False
                     state.recovery_verified_at = now_utc.isoformat()
+                    
+            # Clear pending fields after final confirmation
+            state.pending_confirmation_ended_at = None
+            state.pending_confirmation_mowing_seconds = 0
+            state.pending_confirmation_session_elapsed_seconds = 0
+            state.pending_confirmation_distance_activity = False
+            state.pending_confirmation_runtime_activity = False
+            state.pending_confirmation_battery_activity = False
             return True
     except Exception as err:
         _LOGGER.error("Error checking pending mowing confirmation: %s", err)
@@ -209,12 +234,16 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
         
     norm_status = new_status.strip().lower()
     
-    terminating_statuses = {
+    TERMINATING_STATUSES = {
         "error", "fault", "charging", "sleeping", "parked", 
         "way home", "searching for charging station", "stopped", "off"
     }
     
-    if norm_status in terminating_statuses:
+    TEMPORARY_STATUSES = {
+        "searching", "detecting status"
+    }
+    
+    if norm_status in TERMINATING_STATUSES:
         if state.mowing_session_active:
             if norm_status in ("error", "fault"):
                 state.session_error_detected = True
@@ -243,7 +272,11 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
             state.session_error_detected = False
             state.session_binary_error_detected = False
             state.pending_session_end = False
-            state.pending_mowing_confirmation = False
+            
+            state.session_previous_distance = state.last_distance_value
+            state.session_accumulated_positive_distance = 0.0
+            state.session_distance_activity_detected = False
+            state.distance_reset_count = 0
             
             state.mowing_attempted_today = True
             state.last_mowing_attempt_at = state.session_started_at
@@ -257,7 +290,7 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
                 storage_changed = True
         return storage_changed
         
-    if norm_status in ("searching", "detecting status"):
+    if norm_status in TEMPORARY_STATUSES:
         if state.mowing_session_active and not state.pending_session_end:
             update_accumulated_mowing_time(state, now_utc)
             state.current_mowing_segment_started_at = None
@@ -267,11 +300,64 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
             return True
         return False
         
-    # Fallback: treat any other status as terminating
+    # Fallback for other/unknown statuses: keep session open, pause segment if not already paused
     if state.mowing_session_active:
-        return end_mowing_session(state, now_utc)
-        
+        if not state.pending_session_end:
+            update_accumulated_mowing_time(state, now_utc)
+            state.current_mowing_segment_started_at = None
+            state.interruption_started_at = now_utc.isoformat()
+            state.interruption_status = new_status
+            state.pending_session_end = True
+            return True
     return False
+
+
+def update_robot_distance(state: RobotState, val_float: float | None) -> bool:
+    """Update robot distance metrics, tracking accumulated positive distance and handling resets. Returns True if storage changed."""
+    if val_float is None:
+        return False
+        
+    storage_changed = False
+    
+    # 1. Active mowing session tracking
+    if state.mowing_session_active:
+        state.session_latest_distance = val_float
+        if state.session_start_distance is None:
+            state.session_start_distance = val_float
+            
+        if state.session_previous_distance is not None:
+            delta = val_float - state.session_previous_distance
+            if delta > 0:
+                state.session_accumulated_positive_distance += delta
+                if state.session_accumulated_positive_distance >= DISTANCE_MIN_DELTA_METERS:
+                    state.session_distance_activity_detected = True
+            elif val_float < state.session_previous_distance:
+                # Distance reset detected!
+                state.distance_reset_count += 1
+                
+        state.session_previous_distance = val_float
+        
+    # 2. Movement recovery tracking
+    if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+        if state.recovery_previous_distance is not None:
+            delta = val_float - state.recovery_previous_distance
+            if delta > 0:
+                state.recovery_accumulated_positive_distance += delta
+                if state.recovery_accumulated_positive_distance >= DISTANCE_MIN_DELTA_METERS and state.last_real_error_category == "movement":
+                    state.recovery_state = RecoveryState.RECOVERED
+                    state.failed_recovery = False
+                    state.recovery_verified_at = dt_util.as_utc(dt_util.now()).isoformat()
+                    storage_changed = True
+            
+        state.recovery_previous_distance = val_float
+        
+    # 3. Global distance updates
+    if val_float != state.last_distance_value:
+        state.last_distance_value = val_float
+        state.last_distance_change_at = dt_util.as_utc(dt_util.now()).isoformat()
+        storage_changed = True
+        
+    return storage_changed
 
 
 def check_daily_rollover(state: RobotState, now: datetime) -> bool:

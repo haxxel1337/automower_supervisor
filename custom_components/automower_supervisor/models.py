@@ -75,6 +75,25 @@ class RobotState:
     session_last_mowing_ended_at: str | None = None
     pending_mowing_confirmation: bool = False
 
+    # New session distance tracking (tolerates resets)
+    session_previous_distance: float | None = None
+    session_accumulated_positive_distance: float = 0.0
+    session_distance_activity_detected: bool = False
+    distance_reset_count: int = 0
+
+    # New separate pending confirmation fields
+    pending_confirmation_ended_at: str | None = None
+    pending_confirmation_mowing_seconds: int = 0
+    pending_confirmation_session_elapsed_seconds: int = 0
+    pending_confirmation_distance_activity: bool = False
+    pending_confirmation_runtime_activity: bool = False
+    pending_confirmation_battery_activity: bool = False
+
+    # New recovery distance tracking fields
+    recovery_distance_baseline: float | None = None
+    recovery_accumulated_positive_distance: float = 0.0
+    recovery_previous_distance: float | None = None
+
     # Last Session/Attempt (Persisted)
     last_mowing_attempt_at: str | None = None
     last_mowing_attempt_duration_seconds: int | None = None
