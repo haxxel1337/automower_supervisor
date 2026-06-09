@@ -97,9 +97,12 @@ class AutomowerSupervisorManager:
         # Initial scan of current state machine states
         storage_changed = self.sync_initial_states()
         
-        # Watchdog assessment run immediately once
-        await self._async_watchdog_check(dt_util.now())
-        
+        # Set watchdog checked time and calculate metrics directly
+        now = dt_util.now()
+        self.watchdog_checked_at = now.isoformat()
+        for robot_id in self.robots:
+            self._update_watchdog_for_robot(robot_id, now)
+            
         if storage_changed:
             await self._storage.async_save(self.get_storage_data())
             

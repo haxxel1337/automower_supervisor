@@ -759,3 +759,114 @@ async def test_watchdog_scenarios() -> None:
     assert attrs["robots_unknown_online_state"] == 8
 
 
+@pytest.mark.asyncio
+async def test_setup_optimizations() -> None:
+    """Test setup optimizations to avoid duplicate state sync during setup."""
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    
+    # 1. Setup when storage_changed = False
+    hass.states.get = MagicMock(return_value=None)
+    manager = AutomowerSupervisorManager(hass)
+    
+    sync_calls = 0
+    original_sync = manager.sync_initial_states
+    def spy_sync() -> bool:
+        nonlocal sync_calls
+        sync_calls += 1
+        return original_sync()
+    manager.sync_initial_states = spy_sync
+    
+    save_calls = 0
+    async def spy_save(data: dict) -> None:
+        nonlocal save_calls
+        save_calls += 1
+    manager._storage.async_save = spy_save
+    
+    await manager.async_setup()
+    
+    # Verify sync_initial_states is called exactly once during setup
+    assert sync_calls == 1
+    # Verify watchdog_checked_at is set
+    assert manager.watchdog_checked_at is not None
+    # Verify storage async_save was not called because storage_changed is False
+    assert save_calls == 0
+    
+    # 2. Setup when storage_changed = True
+    manager2 = AutomowerSupervisorManager(hass)
+    manager2._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_at": "2026-06-08T15:40:26+02:00",
+            "error_cleared_at": None,
+            "current_error_active": True,
+            "recovery_state": "active_error",
+        }
+    }
+    
+    # HA states.get returns no error (Fault 0 / off) to trigger state transitions
+    def mock_get(entity_id: str) -> Any:
+        if entity_id == "sensor.automowerkv5_mower_error_message":
+            return MockState("Fault 0")
+        if entity_id == "binary_sensor.automowerkv5_mower_error":
+            return MockState("off")
+        # Provide clock and battery to calculate watchdog metrics
+        if "clock" in entity_id:
+            return MockState("12:00", last_updated=datetime.datetime.now())
+        if "battery" in entity_id:
+            return MockState("90", last_updated=datetime.datetime.now())
+        return None
+    hass.states.get = mock_get
+    
+    sync_calls2 = 0
+    original_sync2 = manager2.sync_initial_states
+    def spy_sync2() -> bool:
+        nonlocal sync_calls2
+        sync_calls2 += 1
+        return original_sync2()
+    manager2.sync_initial_states = spy_sync2
+    
+    save_calls2 = 0
+    async def spy_save2(data: dict) -> None:
+        nonlocal save_calls2
+        save_calls2 += 1
+    manager2._storage.async_save = spy_save2
+    
+    await manager2.async_setup()
+    
+    # sync_initial_states called exactly once during setup
+    assert sync_calls2 == 1
+    # Since storage_changed was True, async_save was called immediately
+    assert save_calls2 == 1
+    # watchdog metrics calculated: online should be True
+    assert manager2.robots["automowerkv5"].online is True
+    assert manager2.robots["automowerkv5"].source_age_minutes is not None
+    
+    # 3. Test periodic watchdog check still runs full sync and calls callbacks
+    sync_calls_watchdog = 0
+    def spy_sync_watchdog() -> bool:
+        nonlocal sync_calls_watchdog
+        sync_calls_watchdog += 1
+        return original_sync2()
+    manager2.sync_initial_states = spy_sync_watchdog
+    
+    cb_called = False
+    def test_cb() -> None:
+        nonlocal cb_called
+        cb_called = True
+    manager2.async_register_callback(test_cb)
+    
+    await manager2._async_watchdog_check(datetime.datetime.now())
+    # sync_initial_states is called again during watchdog run
+    assert sync_calls_watchdog == 1
+    # Callback notified
+    assert cb_called is True
+    
+    # 4. Timer registrations
+    # Check interval for manager2 timer registration (2 timers total now: one for manager, one for manager2)
+    assert len(hass._mock_time_callbacks) == 2
+    assert hass._mock_time_callbacks[0][1] == datetime.timedelta(minutes=5)
+    assert hass._mock_time_callbacks[1][1] == datetime.timedelta(minutes=5)
+
+
+
