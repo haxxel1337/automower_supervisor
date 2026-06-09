@@ -987,8 +987,8 @@ async def test_watchdog_timezone_calculations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_0_3_1_scenarios() -> None:
-    """Comprehensive tests for version 0.3.1 requirements."""
+async def test_version_0_3_2_scenarios() -> None:
+    """Comprehensive tests for version 0.3.2 requirements."""
     hass = MagicMock()
     hass._mock_time_callbacks = []
     states_db = {}
@@ -1022,6 +1022,73 @@ async def test_version_0_3_1_scenarios() -> None:
     assert state.online is True
     assert sensor.native_value == "ok"
 
+    # Status priority tests (Problem 1 & 7)
+    # 1. current_status = "2" and current_status_plain = "Mowing" selects "Mowing" (starts session because plain is Mowing)
+    t_pri = base_time + datetime.timedelta(seconds=30)
+    homeassistant.util.dt.set_time(t_pri)
+    states_db[state.entity_ids["status"]] = MockState("2", last_updated=t_pri)
+    states_db[state.entity_ids["status_plain"]] = MockState("Mowing", last_updated=t_pri)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status"], MockState("2", last_updated=t_pri)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status_plain"], MockState("Mowing", last_updated=t_pri)))
+    
+    # Verify that session is started (meaning it selected Mowing, not 2)
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is False
+    # Verify that last_mowing_attempt_at is not updated when session starts (Problem 3)
+    assert state.last_mowing_attempt_at is None
+
+    # 2. Numeric status does not pause a session when plain status is "Mowing"
+    t_pri2 = t_pri + datetime.timedelta(seconds=30)
+    homeassistant.util.dt.set_time(t_pri2)
+    states_db[state.entity_ids["status"]] = MockState("2", last_updated=t_pri2)
+    states_db[state.entity_ids["status_plain"]] = MockState("Mowing", last_updated=t_pri2)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status"], MockState("2", last_updated=t_pri2)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status_plain"], MockState("Mowing", last_updated=t_pri2)))
+    assert state.mowing_session_active is True
+    assert state.pending_session_end is False
+
+    # 3. current_status = "7" and current_status_plain = "Fault" selects "Fault" (terminates session)
+    t_pri3 = t_pri2 + datetime.timedelta(seconds=30)
+    homeassistant.util.dt.set_time(t_pri3)
+    states_db[state.entity_ids["status"]] = MockState("7", last_updated=t_pri3)
+    states_db[state.entity_ids["status_plain"]] = MockState("Fault", last_updated=t_pri3)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status"], MockState("7", last_updated=t_pri3)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status_plain"], MockState("Fault", last_updated=t_pri3)))
+    assert state.mowing_session_active is False
+    assert state.last_mowing_attempt_result == "failed_error_during_mowing"
+    # Verify that last_mowing_attempt_at is updated when session ends (Problem 3)
+    assert state.last_mowing_attempt_at is not None
+
+    # 4. Watchdog prioritizes plain-status before numeric status
+    t_wd_pri = t_pri3 + datetime.timedelta(seconds=30)
+    homeassistant.util.dt.set_time(t_wd_pri)
+    # Start session again
+    states_db[state.entity_ids["status"]] = MockState("Mowing", last_updated=t_wd_pri)
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=t_wd_pri)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status"], MockState("Mowing", last_updated=t_wd_pri)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status_plain"], MockState("mowing", last_updated=t_wd_pri)))
+    assert state.mowing_session_active is True
+    
+    # Watchdog run with status = "7" (terminating) but status_plain = "Mowing" (active)
+    t_wd_pri2 = t_wd_pri + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_wd_pri2)
+    states_db[state.entity_ids["status"]] = MockState("7", last_updated=t_wd_pri2)
+    states_db[state.entity_ids["status_plain"]] = MockState("mowing", last_updated=t_wd_pri2)
+    states_db[state.entity_ids["clock"]] = MockState("12:06", last_updated=t_wd_pri2)
+    
+    await manager._async_watchdog_check(t_wd_pri2)
+    assert state.mowing_session_active is True
+    
+    # End the session to clean up
+    states_db[state.entity_ids["status"]] = MockState("Charging", last_updated=t_wd_pri2)
+    states_db[state.entity_ids["status_plain"]] = MockState("charging", last_updated=t_wd_pri2)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status"], MockState("Charging", last_updated=t_wd_pri2)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["status_plain"], MockState("charging", last_updated=t_wd_pri2)))
+    assert state.mowing_session_active is False
+    state.last_mowing_attempt_result = None
+    state.last_mowing_attempt_at = None
+    state.last_mowing_ended_at = None
+
     async def set_status(status_val: str, t: datetime.datetime) -> None:
         states_db[state.entity_ids["status"]] = MockState(status_val, last_updated=t)
         states_db[state.entity_ids["status_plain"]] = MockState(status_val.lower(), last_updated=t)
@@ -1033,6 +1100,8 @@ async def test_version_0_3_1_scenarios() -> None:
     homeassistant.util.dt.set_time(t_start)
     await set_status("Mowing", t_start)
     assert state.mowing_session_active is True
+    # Verify that last_mowing_attempt_at is not updated when session starts (Problem 3)
+    assert state.last_mowing_attempt_at is None
     
     t_search = t_start + datetime.timedelta(minutes=2)
     homeassistant.util.dt.set_time(t_search)
@@ -1184,6 +1253,11 @@ async def test_version_0_3_1_scenarios() -> None:
     states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err)
     states_db[state.entity_ids["error_binary"]] = MockState("on", last_updated=t_err)
     await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err)))
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_binary"], MockState("on", last_updated=t_err)))
+    
+    # Active session B should capture the error too (Problem 5)
+    assert state.session_binary_error_detected is True
+    assert state.session_error_detected is True
     
     assert state.pending_mowing_confirmation is False
     assert state.last_mowing_attempt_result == "failed_error_after_mowing"
@@ -1292,6 +1366,108 @@ async def test_version_0_3_1_scenarios() -> None:
     assert state_restart2.pending_mowing_confirmation is False
     assert state_restart2.last_mowing_attempt_result == "failed_error_after_mowing"
     assert state_restart2.failed_recovery is True
+
+    # 15. Startup with active pending confirmation AND robot already mowing (Problem 2, 4, 6)
+    manager_restart3 = AutomowerSupervisorManager(hass)
+    t_restart3 = t_offline + datetime.timedelta(minutes=20)
+    homeassistant.util.dt.set_time(t_restart3)
+    
+    def mock_get_restart3(entity_id: str) -> Any:
+        if "clock" in entity_id:
+            return MockState("12:00", last_updated=t_restart3)
+        if "battery" in entity_id:
+            return MockState("100", last_updated=t_restart3)
+        if "status" in entity_id:
+            return MockState("Mowing", last_updated=t_restart3)
+        if "status_plain" in entity_id:
+            return MockState("mowing", last_updated=t_restart3)
+        return MockState("none", last_updated=t_restart3)
+    hass.states.get = mock_get_restart3
+    
+    t_ended3 = t_restart3 - datetime.timedelta(minutes=2) # Only 2 minutes old -> not expired
+    manager_restart3._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": t_ended3.isoformat(),
+            "pending_confirmation_mowing_seconds": 600,
+            "pending_confirmation_session_elapsed_seconds": 600,
+            "pending_confirmation_distance_activity": True,
+            "recovery_state": "none",
+            "daily_date": "2026-06-09"
+        }
+    }
+    
+    await manager_restart3.async_setup()
+    state_restart3 = manager_restart3.robots[robot_id]
+    
+    # Coexistence check
+    assert state_restart3.mowing_session_active is True
+    assert state_restart3.pending_mowing_confirmation is True
+    
+    # Verify metadata is preserved
+    assert state_restart3.pending_confirmation_ended_at == t_ended3.isoformat()
+    assert state_restart3.pending_confirmation_mowing_seconds == 600
+    assert state_restart3.last_mowing_attempt_at is None
+    
+    # Confirm A after 3 minutes (grace period finishes)
+    t_confirm3 = t_ended3 + datetime.timedelta(minutes=5)
+    homeassistant.util.dt.set_time(t_confirm3)
+    
+    states_db[state_restart3.entity_ids["clock"]] = MockState("12:05", last_updated=t_confirm3)
+    states_db[state_restart3.entity_ids["status"]] = MockState("Mowing", last_updated=t_confirm3)
+    states_db[state_restart3.entity_ids["status_plain"]] = MockState("mowing", last_updated=t_confirm3)
+    
+    await manager_restart3._async_watchdog_check(t_confirm3)
+    
+    assert state_restart3.pending_mowing_confirmation is False
+    assert state_restart3.last_mowing_attempt_result == "confirmed_mowing"
+    assert state_restart3.last_confirmed_mowing_at == t_ended3.isoformat()
+    
+    # B's active fields remain untouched
+    assert state_restart3.mowing_session_active is True
+    assert state_restart3.session_started_source == "startup_observation"
+    assert state_restart3.session_started_at == homeassistant.util.dt.as_utc(t_restart3).isoformat()
+
+    # 16. Startup with expired pending candidate AND robot already mowing
+    manager_restart4 = AutomowerSupervisorManager(hass)
+    t_restart4 = t_offline + datetime.timedelta(minutes=30)
+    homeassistant.util.dt.set_time(t_restart4)
+    
+    def mock_get_restart4(entity_id: str) -> Any:
+        if "clock" in entity_id:
+            return MockState("12:00", last_updated=t_restart4)
+        if "battery" in entity_id:
+            return MockState("100", last_updated=t_restart4)
+        if "status" in entity_id:
+            return MockState("Mowing", last_updated=t_restart4)
+        if "status_plain" in entity_id:
+            return MockState("mowing", last_updated=t_restart4)
+        return MockState("none", last_updated=t_restart4)
+    hass.states.get = mock_get_restart4
+    
+    t_ended4 = t_restart4 - datetime.timedelta(minutes=6) # expired
+    manager_restart4._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": t_ended4.isoformat(),
+            "pending_confirmation_mowing_seconds": 600,
+            "pending_confirmation_session_elapsed_seconds": 600,
+            "pending_confirmation_distance_activity": True,
+            "recovery_state": "none",
+            "daily_date": "2026-06-09"
+        }
+    }
+    
+    await manager_restart4.async_setup()
+    state_restart4 = manager_restart4.robots[robot_id]
+    
+    # Expired pending candidate should be confirmed immediately at startup
+    assert state_restart4.pending_mowing_confirmation is False
+    assert state_restart4.last_mowing_attempt_result == "confirmed_mowing"
+    assert state_restart4.last_confirmed_mowing_at == t_ended4.isoformat()
+    
+    # B is started as a new active session
+    assert state_restart4.mowing_session_active is True
 
 
 

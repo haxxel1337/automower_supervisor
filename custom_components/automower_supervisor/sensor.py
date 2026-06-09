@@ -382,9 +382,7 @@ class AutomowerDiscoverySensor(SensorEntity):
                 robots_unknown_online_state += 1
 
             # Mowing session totals
-            status_norm = (state_data.current_status_plain or "").strip().lower()
-            if not status_norm and state_data.current_status:
-                status_norm = state_data.current_status.strip().lower()
+            status_norm = (state_data.current_status_plain or state_data.current_status or "").strip().lower()
             if status_norm == "mowing":
                 robots_mowing_now += 1
 

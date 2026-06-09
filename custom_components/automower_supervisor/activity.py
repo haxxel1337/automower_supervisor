@@ -279,7 +279,6 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
             state.distance_reset_count = 0
             
             state.mowing_attempted_today = True
-            state.last_mowing_attempt_at = state.session_started_at
             storage_changed = True
         else:
             if state.pending_session_end:
@@ -290,12 +289,16 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
                 storage_changed = True
         return storage_changed
         
+    display_status = new_status
+    if state.current_status and state.current_status.strip().lower() == norm_status:
+        display_status = state.current_status
+
     if norm_status in TEMPORARY_STATUSES:
         if state.mowing_session_active and not state.pending_session_end:
             update_accumulated_mowing_time(state, now_utc)
             state.current_mowing_segment_started_at = None
             state.interruption_started_at = now_utc.isoformat()
-            state.interruption_status = new_status
+            state.interruption_status = display_status
             state.pending_session_end = True
             return True
         return False
@@ -306,7 +309,7 @@ def handle_status_change(state: RobotState, new_status: str | None, now: datetim
             update_accumulated_mowing_time(state, now_utc)
             state.current_mowing_segment_started_at = None
             state.interruption_started_at = now_utc.isoformat()
-            state.interruption_status = new_status
+            state.interruption_status = display_status
             state.pending_session_end = True
             return True
     return False

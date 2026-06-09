@@ -1,6 +1,12 @@
-# Automower Supervisor v0.3.1
+# Automower Supervisor v0.3.2
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.3.2
+
+- **Text Status Prioritization**: Text status (`current_status_plain` / `mower_status_plain`) is prioritized over numeric status values (which are only used as fallback). This ensures that numeric status codes (like `2` or `7`) are not incorrectly treated as unknown statuses or end active sessions.
+- **Persistent Pending Confirmation Coexistence**: Pending confirmations are never cleared or overwritten when a new session starts (including startup observation sessions at Home Assistant startup). The pending confirmation candidate and the active session coexist concurrently.
+- **Attempt Metadata Preservation**: Latest attempt metadata (`last_mowing_attempt_at`) is only updated when a session terminates, preventing active sessions from overwriting metadata of past attempts.
 
 ## Improvements in version 0.3.1
 

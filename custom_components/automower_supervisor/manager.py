@@ -264,9 +264,7 @@ class AutomowerSupervisorManager:
 
             # Handle HA restart during Mowing
             if is_startup:
-                status_norm = (state.current_status_plain or "").strip().lower()
-                if not status_norm and state.current_status:
-                    status_norm = state.current_status.strip().lower()
+                status_norm = (state.current_status_plain or state.current_status or "").strip().lower()
                 if status_norm == "mowing" and not state.mowing_session_active:
                     state.mowing_session_active = True
                     state.session_started_at = dt_util.as_utc(now).isoformat()
@@ -286,10 +284,8 @@ class AutomowerSupervisorManager:
                     state.session_error_detected = False
                     state.session_binary_error_detected = False
                     state.pending_session_end = False
-                    state.pending_mowing_confirmation = False
                     
                     state.mowing_attempted_today = True
-                    state.last_mowing_attempt_at = state.session_started_at
                     storage_changed = True
 
         return storage_changed
@@ -351,7 +347,7 @@ class AutomowerSupervisorManager:
                 
         # If status changed, handle session state machine
         if key in ("status_plain", "status"):
-            status_val = state.current_status or state.current_status_plain
+            status_val = state.current_status_plain or state.current_status
             if handle_status_change(state, status_val, now):
                 storage_changed = True
                 
@@ -635,10 +631,7 @@ class AutomowerSupervisorManager:
                     if end_mowing_session(state, now, "session_lost_offline"):
                         storage_changed = True
                 else:
-                    # Safeguard: if session is active but current status is terminating
-                    status_norm = (state.current_status_plain or "").strip().lower()
-                    if not status_norm and state.current_status:
-                        status_norm = state.current_status.strip().lower()
+                    status_norm = (state.current_status_plain or state.current_status or "").strip().lower()
                         
                     terminating_statuses = {
                         "error", "fault", "charging", "sleeping", "parked", 
