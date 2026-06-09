@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant, Event
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 import homeassistant.util.dt as dt_util
 
-from .const import ROBOTS, ENTITY_PATTERNS, NO_ACTIVE_ERROR_VALUES
+from .const import ROBOTS, ENTITY_PATTERNS, NO_ACTIVE_ERROR_VALUES, ERROR_GRACE_PERIOD_MINUTES
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
 from .error_classifier import classify_error
@@ -23,6 +23,10 @@ from .activity import (
     handle_status_change,
     check_daily_rollover,
     update_robot_distance,
+    clear_pending_confirmation_fields,
+    get_pending_confirmation_age_seconds,
+    confirm_pending_mowing,
+    fail_pending_mowing_after_error,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -448,18 +452,34 @@ class AutomowerSupervisorManager:
                 if is_binary_error:
                     state.session_binary_error_detected = True
 
-            # If pending mowing confirmation, cancel it and mark failed_recovery = True
+            # Evaluate pending mowing confirmation on error
             if state.pending_mowing_confirmation:
-                state.pending_mowing_confirmation = False
-                state.last_mowing_attempt_result = "failed_error_after_mowing"
-                state.failed_recovery = True
-                state.pending_confirmation_ended_at = None
-                state.pending_confirmation_mowing_seconds = 0
-                state.pending_confirmation_session_elapsed_seconds = 0
-                state.pending_confirmation_distance_activity = False
-                state.pending_confirmation_runtime_activity = False
-                state.pending_confirmation_battery_activity = False
-                changed = True
+                if not state.pending_confirmation_ended_at:
+                    _LOGGER.warning(
+                        "Robot %s has pending_mowing_confirmation but pending_confirmation_ended_at is missing. Clearing corrupt state on error.",
+                        state.robot_id,
+                    )
+                    clear_pending_confirmation_fields(state)
+                    changed = True
+                else:
+                    try:
+                        now_dt = datetime.fromisoformat(current_time_iso)
+                        age = get_pending_confirmation_age_seconds(state, now_dt)
+                        if age is None:
+                            clear_pending_confirmation_fields(state)
+                            changed = True
+                        elif age >= ERROR_GRACE_PERIOD_MINUTES * 60:
+                            # Confirm pending candidate first, then treat this as a new error
+                            if confirm_pending_mowing(state, now_dt):
+                                changed = True
+                        else:
+                            # Within grace period, fail it
+                            if fail_pending_mowing_after_error(state):
+                                changed = True
+                    except Exception as err:
+                        _LOGGER.error("Error evaluating pending confirmation age on error: %s", err)
+                        clear_pending_confirmation_fields(state)
+                        changed = True
         else:
             # No active error reported by sensors
             if state.recovery_state == RecoveryState.ACTIVE_ERROR:

@@ -181,41 +181,90 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
     return storage_changed
 
 
-def check_pending_mowing_confirmation(state: RobotState, now: datetime) -> bool:
-    """Check if the 5-minute grace period has passed for a pending mowing confirmation. Returns True if storage changed."""
+def clear_pending_confirmation_fields(state: RobotState) -> None:
+    """Clear all pending confirmation fields on the RobotState."""
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_ended_at = None
+    state.pending_confirmation_mowing_seconds = 0
+    state.pending_confirmation_session_elapsed_seconds = 0
+    state.pending_confirmation_distance_activity = False
+    state.pending_confirmation_runtime_activity = False
+    state.pending_confirmation_battery_activity = False
+
+
+def get_pending_confirmation_age_seconds(state: RobotState, now: datetime) -> float | None:
+    """Get the age of the pending confirmation in seconds, or None if invalid/corrupt state."""
     if not state.pending_mowing_confirmation or not state.pending_confirmation_ended_at:
-        return False
-        
+        return None
     try:
         ended_at = datetime.fromisoformat(state.pending_confirmation_ended_at)
         now_utc = dt_util.as_utc(now)
         ended_at_utc = dt_util.as_utc(ended_at)
-        elapsed = (now_utc - ended_at_utc).total_seconds()
-        
-        if elapsed >= ERROR_GRACE_PERIOD_MINUTES * 60:
-            state.pending_mowing_confirmation = False
-            state.last_mowing_attempt_result = "confirmed_mowing"
-            state.last_confirmed_mowing_at = state.pending_confirmation_ended_at
-            state.last_confirmed_mowing_duration_seconds = state.pending_confirmation_mowing_seconds
-            state.confirmed_mowing_today = True
-            
-            # Verify recovery if cleared but unverified and error category is cutting, other, or none
-            if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-                if state.last_real_error_category in ("cutting", "other", "none"):
-                    state.recovery_state = RecoveryState.RECOVERED
-                    state.failed_recovery = False
-                    state.recovery_verified_at = now_utc.isoformat()
-                    
-            # Clear pending fields after final confirmation
-            state.pending_confirmation_ended_at = None
-            state.pending_confirmation_mowing_seconds = 0
-            state.pending_confirmation_session_elapsed_seconds = 0
-            state.pending_confirmation_distance_activity = False
-            state.pending_confirmation_runtime_activity = False
-            state.pending_confirmation_battery_activity = False
-            return True
+        return (now_utc - ended_at_utc).total_seconds()
     except Exception as err:
-        _LOGGER.error("Error checking pending mowing confirmation: %s", err)
+        _LOGGER.warning(
+            "Error parsing pending_confirmation_ended_at '%s' for robot %s: %s",
+            state.pending_confirmation_ended_at,
+            state.robot_id,
+            err,
+        )
+        return None
+
+
+def confirm_pending_mowing(state: RobotState, now: datetime) -> bool:
+    """Finalize and confirm the pending mowing session. Returns True if storage changed."""
+    if not state.pending_mowing_confirmation or not state.pending_confirmation_ended_at:
+        return False
+        
+    now_utc = dt_util.as_utc(now)
+    state.last_mowing_attempt_result = "confirmed_mowing"
+    state.last_confirmed_mowing_at = state.pending_confirmation_ended_at
+    state.last_confirmed_mowing_duration_seconds = state.pending_confirmation_mowing_seconds
+    state.confirmed_mowing_today = True
+    
+    # Verify recovery if cleared but unverified and error category is cutting, other, or none
+    if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+        if state.last_real_error_category in ("cutting", "other", "none"):
+            state.recovery_state = RecoveryState.RECOVERED
+            state.failed_recovery = False
+            state.recovery_verified_at = now_utc.isoformat()
+            
+    clear_pending_confirmation_fields(state)
+    return True
+
+
+def fail_pending_mowing_after_error(state: RobotState) -> bool:
+    """Fail the pending mowing session due to an error during grace period. Returns True if storage changed."""
+    if not state.pending_mowing_confirmation:
+        return False
+    state.last_mowing_attempt_result = "failed_error_after_mowing"
+    state.failed_recovery = True
+    clear_pending_confirmation_fields(state)
+    return True
+
+
+def check_pending_mowing_confirmation(state: RobotState, now: datetime) -> bool:
+    """Check if the 5-minute grace period has passed for a pending mowing confirmation. Returns True if storage changed."""
+    if not state.pending_mowing_confirmation:
+        return False
+        
+    if not state.pending_confirmation_ended_at:
+        _LOGGER.warning(
+            "Robot %s has pending_mowing_confirmation but pending_confirmation_ended_at is missing. Clearing corrupt state.",
+            state.robot_id,
+        )
+        clear_pending_confirmation_fields(state)
+        return True
+        
+    age = get_pending_confirmation_age_seconds(state, now)
+    if age is None:
+        # Corrupt date, clear pending state
+        clear_pending_confirmation_fields(state)
+        return True
+        
+    if age >= ERROR_GRACE_PERIOD_MINUTES * 60:
+        return confirm_pending_mowing(state, now)
+        
     return False
 
 

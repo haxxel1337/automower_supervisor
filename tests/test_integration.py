@@ -987,8 +987,8 @@ async def test_watchdog_timezone_calculations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_0_3_2_scenarios() -> None:
-    """Comprehensive tests for version 0.3.2 requirements."""
+async def test_version_0_3_3_scenarios() -> None:
+    """Comprehensive tests for version 0.3.3 requirements."""
     hass = MagicMock()
     hass._mock_time_callbacks = []
     states_db = {}
@@ -1364,8 +1364,37 @@ async def test_version_0_3_2_scenarios() -> None:
     await manager_restart2.async_setup()
     state_restart2 = manager_restart2.robots[robot_id]
     assert state_restart2.pending_mowing_confirmation is False
-    assert state_restart2.last_mowing_attempt_result == "failed_error_after_mowing"
-    assert state_restart2.failed_recovery is True
+    assert state_restart2.last_mowing_attempt_result == "confirmed_mowing"
+    assert state_restart2.last_confirmed_mowing_at == t_ended.isoformat()
+    assert state_restart2.current_error_active is True
+    
+    # Startup with pending within grace and active error -> underkänner den (failed_error_after_mowing)
+    manager_restart2_grace = AutomowerSupervisorManager(hass)
+    def mock_get_restart2_grace(entity_id: str) -> Any:
+        if "error_message" in entity_id:
+            return MockState("Blade disc blocked", last_updated=t_restart)
+        if "error_binary" in entity_id:
+            return MockState("on", last_updated=t_restart)
+        return MockState("Sleeping", last_updated=t_restart)
+    hass.states.get = mock_get_restart2_grace
+    
+    t_ended_within_grace = t_restart - datetime.timedelta(minutes=2)
+    manager_restart2_grace._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": t_ended_within_grace.isoformat(),
+            "pending_confirmation_mowing_seconds": 600,
+            "pending_confirmation_session_elapsed_seconds": 600,
+            "recovery_state": "cleared_but_unverified",
+            "daily_date": "2026-06-09"
+        }
+    }
+    
+    await manager_restart2_grace.async_setup()
+    state_restart2_grace = manager_restart2_grace.robots[robot_id]
+    assert state_restart2_grace.pending_mowing_confirmation is False
+    assert state_restart2_grace.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state_restart2_grace.failed_recovery is True
 
     # 15. Startup with active pending confirmation AND robot already mowing (Problem 2, 4, 6)
     manager_restart3 = AutomowerSupervisorManager(hass)
@@ -1468,6 +1497,188 @@ async def test_version_0_3_2_scenarios() -> None:
     
     # B is started as a new active session
     assert state_restart4.mowing_session_active is True
+
+    # ----------------------------------------------------
+    # Additional 0.3.3 specific test cases
+    # ----------------------------------------------------
+    
+    # Reset KV5 robot state completely to sleeping/idle
+    state.pending_mowing_confirmation = False
+    state.mowing_session_active = False
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    
+    # 1. Fel 2 minuter efter sessionen ger failed_error_after_mowing.
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 600
+    state.last_mowing_attempt_result = "confirmation_pending"
+    
+    t_err_1 = base_time + datetime.timedelta(minutes=2)
+    homeassistant.util.dt.set_time(t_err_1)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_1)
+    states_db[state.entity_ids["error_binary"]] = MockState("on", last_updated=t_err_1)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_1)))
+    
+    assert state.pending_mowing_confirmation is False
+    assert state.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state.failed_recovery is True
+    
+    # 2. Fel exakt före fem minuter (4m 59s) ger failed.
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 600
+    state.last_mowing_attempt_result = "confirmation_pending"
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=base_time)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=base_time)))
+    
+    t_err_2 = base_time + datetime.timedelta(seconds=299)
+    homeassistant.util.dt.set_time(t_err_2)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_2)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_2)))
+    
+    assert state.pending_mowing_confirmation is False
+    assert state.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state.failed_recovery is True
+    
+    # 3. Fel exakt vid fem minuter bekräftar pending session först.
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 600
+    state.last_mowing_attempt_result = "confirmation_pending"
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=base_time)))
+    
+    t_err_3 = base_time + datetime.timedelta(seconds=300)
+    homeassistant.util.dt.set_time(t_err_3)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_3)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_3)))
+    
+    assert state.pending_mowing_confirmation is False
+    assert state.last_mowing_attempt_result == "confirmed_mowing"
+    assert state.last_confirmed_mowing_at == base_time.isoformat()
+    assert state.current_error_active is True
+    
+    # 4. Fel 20 minuter efter sessionen bekräftar sessionen först.
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 700
+    state.last_mowing_attempt_result = "confirmation_pending"
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=base_time)))
+    
+    t_err_4 = base_time + datetime.timedelta(minutes=20)
+    homeassistant.util.dt.set_time(t_err_4)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_4)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_4)))
+    
+    assert state.pending_mowing_confirmation is False
+    assert state.last_mowing_attempt_result == "confirmed_mowing"
+    assert state.last_confirmed_mowing_at == base_time.isoformat()
+    assert state.current_error_active is True
+    
+    # 5 & 6. Nytt fel efter grace påverkar inte last_confirmed_mowing_at / duration
+    assert state.last_confirmed_mowing_at == base_time.isoformat()
+    assert state.last_confirmed_mowing_duration_seconds == 700
+    
+    # 7 & 8. Pending-fält rensas efter confirmation / failure
+    assert state.pending_mowing_confirmation is False
+    assert state.pending_confirmation_ended_at is None
+    assert state.pending_confirmation_mowing_seconds == 0
+    assert state.pending_confirmation_session_elapsed_seconds == 0
+    assert state.pending_confirmation_distance_activity is False
+    assert state.pending_confirmation_runtime_activity is False
+    assert state.pending_confirmation_battery_activity is False
+    
+    # 9, 10 & 11. Aktiv session B markeras med fel samtidigt som pending session A bekräftas/underkänns, och A:s outcome rensar inte B:s session_* fält
+    # Case: A underkänns, B får fel
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=base_time)))
+    
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 500
+    
+    state.mowing_session_active = True
+    state.session_started_at = (base_time + datetime.timedelta(minutes=2)).isoformat()
+    state.session_started_source = "manual"
+    state.accumulated_mowing_seconds = 120
+    
+    t_err_9 = base_time + datetime.timedelta(minutes=3)
+    homeassistant.util.dt.set_time(t_err_9)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_9)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_9)))
+    
+    # A should fail
+    assert state.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state.pending_mowing_confirmation is False
+    # B should get error flags but keep session active
+    assert state.mowing_session_active is True
+    assert state.session_error_detected is True
+    assert state.session_started_at == (base_time + datetime.timedelta(minutes=2)).isoformat()
+    assert state.accumulated_mowing_seconds == 120
+    
+    # Case: A bekräftas, B får fel
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=base_time)))
+    
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = base_time.isoformat()
+    state.pending_confirmation_mowing_seconds = 800
+    
+    state.mowing_session_active = True
+    state.session_started_at = (base_time + datetime.timedelta(minutes=2)).isoformat()
+    state.session_started_source = "manual"
+    state.accumulated_mowing_seconds = 240
+    state.session_error_detected = False
+    
+    t_err_10 = base_time + datetime.timedelta(minutes=6)
+    homeassistant.util.dt.set_time(t_err_10)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_10)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_10)))
+    
+    # A should confirm
+    assert state.last_mowing_attempt_result == "confirmed_mowing"
+    assert state.last_confirmed_mowing_at == base_time.isoformat()
+    assert state.last_confirmed_mowing_duration_seconds == 800
+    assert state.pending_mowing_confirmation is False
+    # B should get error flags but keep session active and untouched
+    assert state.mowing_session_active is True
+    assert state.session_error_detected is True
+    assert state.session_started_at == (base_time + datetime.timedelta(minutes=2)).isoformat()
+    assert state.accumulated_mowing_seconds == 240
+    
+    # 16 & 17. Ogiltig / None pending_confirmation_ended_at kraschar inte integrationen
+    # 16. Ogiltig date string
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = "invalid-date"
+    state.pending_confirmation_mowing_seconds = 600
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_10)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_10)))
+    assert state.pending_mowing_confirmation is False
+    
+    # 17. None
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_ended_at = None
+    state.pending_confirmation_mowing_seconds = 600
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.NONE
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_err_10)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_err_10)))
+    assert state.pending_mowing_confirmation is False
 
 
 
