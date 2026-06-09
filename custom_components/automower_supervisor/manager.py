@@ -425,34 +425,7 @@ class AutomowerSupervisorManager:
         changed = False
         
         if current_active:
-            if not state.current_error_active:
-                state.current_error_active = True
-                changed = True
-            if state.recovery_state != RecoveryState.ACTIVE_ERROR:
-                if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-                    state.failed_recovery = True
-                state.recovery_state = RecoveryState.ACTIVE_ERROR
-                changed = True
-            if state.error_cleared_at is not None:
-                state.error_cleared_at = None
-                changed = True
-                
-            if is_real_error:
-                # Update timestamp ONLY if we are transitioning to active or the error text changed
-                if not was_error_active or state.last_real_error != state.current_error_message:
-                    state.last_real_error = state.current_error_message
-                    state.last_real_error_at = current_time_iso
-                    state.last_real_error_category = classify_error(state.current_error_message)
-                    changed = True
-
-            # If there is an active session, mark error detected
-            if state.mowing_session_active:
-                if is_real_error:
-                    state.session_error_detected = True
-                if is_binary_error:
-                    state.session_binary_error_detected = True
-
-            # Evaluate pending mowing confirmation on error
+            # Evaluate pending mowing confirmation on error first
             if state.pending_mowing_confirmation:
                 if not state.pending_confirmation_ended_at:
                     _LOGGER.warning(
@@ -480,6 +453,34 @@ class AutomowerSupervisorManager:
                         _LOGGER.error("Error evaluating pending confirmation age on error: %s", err)
                         clear_pending_confirmation_fields(state)
                         changed = True
+
+            # Then process the new active error
+            if not state.current_error_active:
+                state.current_error_active = True
+                changed = True
+            if state.recovery_state != RecoveryState.ACTIVE_ERROR:
+                if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+                    state.failed_recovery = True
+                state.recovery_state = RecoveryState.ACTIVE_ERROR
+                changed = True
+            if state.error_cleared_at is not None:
+                state.error_cleared_at = None
+                changed = True
+                
+            if is_real_error:
+                # Update timestamp ONLY if we are transitioning to active or the error text changed
+                if not was_error_active or state.last_real_error != state.current_error_message:
+                    state.last_real_error = state.current_error_message
+                    state.last_real_error_at = current_time_iso
+                    state.last_real_error_category = classify_error(state.current_error_message)
+                    changed = True
+
+            # If there is an active session, mark error detected
+            if state.mowing_session_active:
+                if is_real_error:
+                    state.session_error_detected = True
+                if is_binary_error:
+                    state.session_binary_error_detected = True
         else:
             # No active error reported by sensors
             if state.recovery_state == RecoveryState.ACTIVE_ERROR:
