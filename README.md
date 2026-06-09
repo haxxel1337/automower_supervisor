@@ -1,6 +1,12 @@
-# Automower Supervisor v0.3.4
+# Automower Supervisor v0.3.5
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.3.5
+
+- **Automatic Category Backfill**: On startup, when loading persistent storage, any missing, empty, "none", or invalid error categories are automatically recalculated from `last_real_error` using the deterministic `classify_error()` helper.
+- **Migration Storage Persistence**: If any migrations or category corrections occur at startup, the updated states are immediately written back to persistent storage.
+- **State and Timestamp Preservation**: The startup backfill/migration is purely diagnostic and database-only; it does not change error timestamps (`last_real_error_at`), set `current_error_active`, change the recovery state machine (`recovery_state`), or trigger new error events.
 
 ## Improvements in version 0.3.4
 

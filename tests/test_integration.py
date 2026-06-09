@@ -987,8 +987,8 @@ async def test_watchdog_timezone_calculations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_0_3_4_scenarios() -> None:
-    """Comprehensive tests for version 0.3.4 requirements."""
+async def test_version_0_3_5_scenarios() -> None:
+    """Comprehensive tests for version 0.3.5 requirements."""
     hass = MagicMock()
     hass._mock_time_callbacks = []
     states_db = {}
@@ -1670,6 +1670,267 @@ async def test_version_0_3_4_scenarios() -> None:
     states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_bin_err)
     await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_bin_err)))
     assert state.pending_mowing_confirmation is False
+
+    # ----------------------------------------------------
+    # Version 0.3.5 Backfill & Migration Scenarios
+    # ----------------------------------------------------
+    # 1. Äldre storage med `Blade disc blocked` och saknad kategori blir `cutting`.
+    manager_1 = AutomowerSupervisorManager(hass)
+    manager_1._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_1 = await manager_1._async_load_storage()
+    assert manager_1.robots["automowerkv5"].last_real_error_category == "cutting"
+    assert storage_changed_1 is True
+
+    # 2. Äldre storage med `Blade disc blocked` och kategori `none` blir `cutting`.
+    manager_2 = AutomowerSupervisorManager(hass)
+    manager_2._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "none",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_2 = await manager_2._async_load_storage()
+    assert manager_2.robots["automowerkv5"].last_real_error_category == "cutting"
+    assert storage_changed_2 is True
+
+    # 3. `No traction` och null-kategori blir `movement`.
+    manager_3 = AutomowerSupervisorManager(hass)
+    manager_3._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "No traction",
+            "last_real_error_category": None,
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_3 = await manager_3._async_load_storage()
+    assert manager_3.robots["automowerkv5"].last_real_error_category == "movement"
+    assert storage_changed_3 is True
+
+    # 4. Kommunikationsfel och tom kategori blir `communication`.
+    manager_4 = AutomowerSupervisorManager(hass)
+    manager_4._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "communication lost",
+            "last_real_error_category": "  ",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_4 = await manager_4._async_load_storage()
+    assert manager_4.robots["automowerkv5"].last_real_error_category == "communication"
+    assert storage_changed_4 is True
+
+    # 5. Okänt riktigt fel blir `other`.
+    manager_5 = AutomowerSupervisorManager(hass)
+    manager_5._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Extremely weird hardware error",
+            "last_real_error_category": None,
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_5 = await manager_5._async_load_storage()
+    assert manager_5.robots["automowerkv5"].last_real_error_category == "other"
+    assert storage_changed_5 is True
+
+    # 6. `last_real_error = null` behåller `none`.
+    manager_6 = AutomowerSupervisorManager(hass)
+    manager_6._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": None,
+            "last_real_error_category": "none",
+            "last_real_error_at": None,
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_6 = await manager_6._async_load_storage()
+    assert manager_6.robots["automowerkv5"].last_real_error_category == "none"
+    assert storage_changed_6 is False
+
+    # 7. Befintlig giltig kategori `cutting` skrivs inte över.
+    manager_7 = AutomowerSupervisorManager(hass)
+    manager_7._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "cutting",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_7 = await manager_7._async_load_storage()
+    assert manager_7.robots["automowerkv5"].last_real_error_category == "cutting"
+    assert storage_changed_7 is False
+
+    # 8. Befintlig giltig kategori `movement` skrivs inte över.
+    manager_8 = AutomowerSupervisorManager(hass)
+    manager_8._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "movement",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_8 = await manager_8._async_load_storage()
+    assert manager_8.robots["automowerkv5"].last_real_error_category == "movement"
+    assert storage_changed_8 is False
+
+    # 9. Ogiltig lagrad kategori klassificeras om från feltexten.
+    manager_9 = AutomowerSupervisorManager(hass)
+    manager_9._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "invalid_category_value",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    storage_changed_9 = await manager_9._async_load_storage()
+    assert manager_9.robots["automowerkv5"].last_real_error_category == "cutting"
+    assert storage_changed_9 is True
+
+    # 10. Backfill ändrar inte `last_real_error_at`.
+    manager_10 = AutomowerSupervisorManager(hass)
+    test_time = "2026-06-09T10:00:00"
+    manager_10._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+            "last_real_error_at": test_time,
+            "recovery_state": "none",
+            "current_error_active": False,
+        }
+    }
+    await manager_10._async_load_storage()
+    assert manager_10.robots["automowerkv5"].last_real_error_at == test_time
+
+    # 11. Backfill ändrar inte `recovery_state`.
+    manager_11 = AutomowerSupervisorManager(hass)
+    manager_11._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "cleared_but_unverified",
+            "current_error_active": False,
+        }
+    }
+    await manager_11._async_load_storage()
+    assert manager_11.robots["automowerkv5"].recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+
+    # 12. Backfill ändrar inte `current_error_active`.
+    manager_12 = AutomowerSupervisorManager(hass)
+    manager_12._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "recovery_state": "none",
+            "current_error_active": True,
+        }
+    }
+    await manager_12._async_load_storage()
+    assert manager_12.robots["automowerkv5"].current_error_active is True
+
+    # 13. Backfill markerar storage som ändrad.
+    manager_13 = AutomowerSupervisorManager(hass)
+    manager_13._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+        }
+    }
+    storage_changed_13 = await manager_13._async_load_storage()
+    assert storage_changed_13 is True
+
+    # 14. Den korrigerade kategorin sparas tillbaka vid setup.
+    manager_14 = AutomowerSupervisorManager(hass)
+    manager_14._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": None,
+        }
+    }
+    def mock_get_14(entity_id: str) -> Any:
+        if "clock" in entity_id:
+            return MockState("12:00", last_updated=homeassistant.util.dt.now())
+        if "battery" in entity_id:
+            return MockState("90", last_updated=homeassistant.util.dt.now())
+        return None
+    hass.states.get = mock_get_14
+
+    save_called_14 = False
+    saved_data_14 = None
+    async def mock_save_14(data: dict) -> None:
+        nonlocal save_called_14, saved_data_14
+        save_called_14 = True
+        saved_data_14 = data
+    manager_14._storage.async_save = mock_save_14
+    await manager_14.async_setup()
+    assert save_called_14 is True
+    assert saved_data_14["automowerkv5"]["last_real_error_category"] == "cutting"
+
+    # 15. Storage från version 0.3.4 laddas bakåtkompatibelt.
+    manager_15 = AutomowerSupervisorManager(hass)
+    manager_15._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_at": "2026-06-09T10:00:00",
+            "error_cleared_at": None,
+            "current_error_active": True,
+            "recovery_state": "active_error",
+            "last_mowing_attempt_at": None,
+            "last_mowing_attempt_duration_seconds": 0,
+            "last_mowing_session_elapsed_seconds": 0,
+            "last_mowing_attempt_result": None,
+            "last_mowing_ended_at": None,
+            "last_confirmed_mowing_at": None,
+            "last_confirmed_mowing_duration_seconds": 0,
+            "last_distance_value": None,
+            "last_distance_change_at": None,
+            "last_runtime_hours_value": None,
+            "last_runtime_change_at": None,
+            "confirmed_mowing_today": False,
+            "mowing_attempted_today": False,
+            "failed_recovery": False,
+            "recovery_verified_at": None,
+            "last_real_error_category": "none",
+            "pending_mowing_confirmation": False,
+            "pending_confirmation_ended_at": None,
+            "pending_confirmation_mowing_seconds": 0,
+            "pending_confirmation_session_elapsed_seconds": 0,
+            "pending_confirmation_distance_activity": False,
+            "pending_confirmation_runtime_activity": False,
+            "pending_confirmation_battery_activity": False,
+            "recovery_distance_baseline": None,
+            "recovery_accumulated_positive_distance": 0.0,
+            "recovery_previous_distance": None,
+            "daily_date": "2026-06-09"
+        }
+    }
+    storage_changed_15 = await manager_15._async_load_storage()
+    assert storage_changed_15 is True
+    assert manager_15.robots["automowerkv5"].last_real_error_category == "cutting"
 
 
 

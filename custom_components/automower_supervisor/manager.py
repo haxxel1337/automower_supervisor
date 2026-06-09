@@ -50,6 +50,45 @@ def get_robot_suffix(robot_id: str) -> str:
     return mapping.get(robot_id, robot_id)
 
 
+def normalize_stored_error_category(
+    error_message: str | None,
+    stored_category: Any,
+) -> tuple[str, bool]:
+    """Normalize and backfill error category if missing or invalid.
+    
+    Returns (normalized_category, is_changed).
+    """
+    valid_categories = {
+        "cutting",
+        "movement",
+        "communication",
+        "other",
+        "none",
+    }
+    
+    cat_str = str(stored_category).strip() if stored_category is not None else ""
+    cat_lower = cat_str.lower()
+    
+    # If category is missing or empty or explicitly "none"
+    if not cat_str or cat_lower == "none":
+        if error_message:
+            new_cat = classify_error(error_message)
+            is_changed = (stored_category is None or cat_lower != new_cat)
+            return new_cat, is_changed
+        return "none", (stored_category is not None and cat_lower != "none")
+        
+    # If the category is invalid
+    if cat_lower not in valid_categories:
+        if error_message:
+            new_cat = classify_error(error_message)
+            return new_cat, True
+        return "none", True
+        
+    # If it is valid but has extra spaces or uppercase letters, let's normalize it
+    is_changed = (stored_category != cat_lower)
+    return cat_lower, is_changed
+
+
 def _update_entity_state_lists(state: RobotState, entity_id: str, target_list_name: str | None) -> None:
     """Ensure entity_id is mutually exclusive and present in at most one list without duplicates."""
     for lst in (state.missing_entities, state.unavailable_entities, state.unknown_entities):
@@ -99,10 +138,11 @@ class AutomowerSupervisorManager:
         _LOGGER.debug("Setting up Automower Supervisor manager")
         
         # Load from disk
-        await self._async_load_storage()
+        storage_changed = await self._async_load_storage()
         
         # Initial scan of current state machine states
-        storage_changed = self.sync_initial_states(is_startup=True)
+        if self.sync_initial_states(is_startup=True):
+            storage_changed = True
         
         # Set watchdog checked time and calculate metrics directly
         now = dt_util.now()
@@ -123,8 +163,9 @@ class AutomowerSupervisorManager:
             timedelta(minutes=5)
         )
 
-    async def _async_load_storage(self) -> None:
-        """Load persistent storage and apply it to the robot states."""
+    async def _async_load_storage(self) -> bool:
+        """Load persistent storage and apply it to the robot states. Returns True if storage changed."""
+        storage_changed = False
         # Initialize daily_date for all robots first to prevent unwanted first-run save calls
         now = dt_util.now()
         current_date = get_daily_date(now)
@@ -134,7 +175,7 @@ class AutomowerSupervisorManager:
         stored_data = await self._storage.async_load()
         if not stored_data:
             _LOGGER.debug("No persistent storage data found")
-            return
+            return False
             
         _LOGGER.debug("Loading persistent storage data: %s", stored_data)
         for robot_id, data in stored_data.items():
@@ -168,7 +209,16 @@ class AutomowerSupervisorManager:
             state.mowing_attempted_today = bool(data.get("mowing_attempted_today", False))
             state.failed_recovery = bool(data.get("failed_recovery", False))
             state.recovery_verified_at = data.get("recovery_verified_at")
-            state.last_real_error_category = data.get("last_real_error_category", "none")
+            
+            # Backfill and normalize error category
+            stored_category = data.get("last_real_error_category")
+            normalized_cat, is_changed = normalize_stored_error_category(
+                state.last_real_error,
+                stored_category,
+            )
+            state.last_real_error_category = normalized_cat
+            if is_changed:
+                storage_changed = True
             
             state.pending_mowing_confirmation = bool(data.get("pending_mowing_confirmation", False))
             state.pending_confirmation_ended_at = data.get("pending_confirmation_ended_at")
@@ -184,6 +234,8 @@ class AutomowerSupervisorManager:
             
             if "daily_date" in data and data["daily_date"] is not None:
                 state.daily_date = data["daily_date"]
+
+        return storage_changed
 
     def get_storage_data(self) -> dict[str, dict[str, Any]]:
         """Return a dictionary of serializable state information to store on disk."""
