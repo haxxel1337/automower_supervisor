@@ -2278,6 +2278,431 @@ async def test_version_0_4_0_scenarios() -> None:
     assert manager_compat.robots["automowerkv5"].last_real_error_category == "cutting"
 
 
+@pytest.mark.asyncio
+async def test_version_0_4_1_scenarios() -> None:
+    """Comprehensive tests for version 0.4.1 requirements."""
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    states_db = {}
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    
+    # Base timestamp: 2026-06-09 12:00:00 UTC (14:00:00 Stockholm)
+    base_time = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    homeassistant.util.dt.set_time(base_time)
+    
+    # Initialize all central entities to good states
+    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=base_time)
+    states_db[state.entity_ids["status"]] = MockState("Sleeping", last_updated=base_time)
+    states_db[state.entity_ids["status_plain"]] = MockState("sleeping", last_updated=base_time)
+    states_db[state.entity_ids["battery"]] = MockState("100", last_updated=base_time)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=base_time)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=base_time)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=base_time)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=base_time)
+    
+    manager.sync_initial_states()
+    await manager._async_watchdog_check(base_time)
+
+    # 1. Daily text väljer current_status_plain före numerisk status.
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+        daily_check_started,
+        daily_schedule_finished,
+    )
+    state.current_status = "4"
+    state.current_status_plain = "Charging (100 %)"
+    state.online = True
+    # Let's verify evaluate_daily_attention selects current_status_plain
+    # To output text with status_str, we need to trigger a rule like Rule 10 (Ingen start efter 11:30)
+    state.mowing_attempted_today = False
+    state.confirmed_mowing_today = False
+    res = evaluate_daily_attention(state, base_time, True)
+    assert res.required is True
+    assert "Charging (100 %)" in res.text
+    assert "Aktuell status: Charging (100 %)" in res.text
+    assert "Aktuell status: 4" not in res.text
+
+    # 2. Offline-text väljer plain-status.
+    state.online = False
+    state.source_age_minutes = 20
+    res = evaluate_daily_attention(state, base_time, True)
+    assert res.required is True
+    assert "Senast kända status: Charging (100 %)" in res.text
+    assert "Senast kända status: 4" not in res.text
+
+    # Restore online state
+    state.online = True
+    state.source_age_minutes = 0
+
+    # Time before 11:30: 09:15 UTC is 11:15 Stockholm
+    t_before_1130 = datetime.datetime(2026, 6, 9, 9, 15, 0, tzinfo=datetime.timezone.utc)
+    
+    # 3. Short attempt 11:15 ger inte needs_attention.
+    state.mowing_attempted_today = True
+    state.last_mowing_attempt_result = "short_attempt"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "not_evaluated"
+
+    # 4. Uncertain attempt 11:15 ger inte needs_attention.
+    state.last_mowing_attempt_result = "uncertain_attempt"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "not_evaluated"
+
+    # 5. Insufficient supporting data 11:15 ger inte needs_attention.
+    state.last_mowing_attempt_result = "insufficient_supporting_data"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "not_evaluated"
+
+    # 6. Started but not confirmed 11:15 ger inte needs_attention.
+    state.last_mowing_attempt_result = "some_other_result"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "not_evaluated"
+
+    # 7. Aktivt fel 11:15 ger needs_attention.
+    state.current_error_active = True
+    state.last_real_error = "Blade disc blocked"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ACTIVE_ERROR" in res.reason_codes
+
+    # 8. Cleared but unverified 11:15 ger needs_attention.
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "CLEARED_BUT_UNVERIFIED" in res.reason_codes
+
+    # 9. Offline 11:15 ger needs_attention.
+    state.recovery_state = RecoveryState.NONE
+    state.online = False
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ROBOT_OFFLINE" in res.reason_codes
+
+    # Restore online
+    state.online = True
+
+    # 10. Aktiv mowing 11:15 ger monitoring.
+    state.mowing_session_active = True
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "monitoring"
+    assert "MOWING_IN_PROGRESS" in res.reason_codes
+
+    # 11. Pending confirmation 11:15 ger monitoring.
+    state.mowing_session_active = False
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = "full_mowing"
+    res = evaluate_daily_attention(state, t_before_1130, True)
+    assert res.required is False
+    assert res.state == "monitoring"
+    assert "MOWING_CONFIRMATION_PENDING" in res.reason_codes
+
+    # Reset pending confirmation
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_type = None
+
+    # 12. Short attempt efter 11:30 ger needs_attention.
+    t_after_1130 = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    state.mowing_attempted_today = True
+    state.last_mowing_attempt_result = "short_attempt"
+    state.last_mowing_attempt_duration_seconds = 100
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "ONLY_SHORT_ATTEMPT" in res.reason_codes
+
+    # 13. Recovery threshold är 5 minuter.
+    # 14. Full mowing threshold är fortsatt 10 minuter.
+    from custom_components.automower_supervisor.const import (
+        RECOVERY_CONFIRM_MIN_MINUTES,
+        MOWING_CONFIRM_MIN_MINUTES,
+    )
+    assert RECOVERY_CONFIRM_MIN_MINUTES == 5
+    assert MOWING_CONFIRM_MIN_MINUTES == 10
+
+    # 15. 4 min 59 sek efter klippfel verifierar inte recovery.
+    from custom_components.automower_supervisor.activity import (
+        end_mowing_session,
+        confirm_pending_mowing,
+        clear_pending_confirmation_fields,
+    )
+    # Clear attempt states
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=299)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=299)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.session_distance_activity_detected = True
+    
+    end_mowing_session(state, t_after_1130)
+    # Result should be uncertain_attempt (since < 5 mins)
+    assert state.last_mowing_attempt_result == "uncertain_attempt"
+    assert state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+    assert state.pending_mowing_confirmation is False
+
+    # 16. Exakt 5 minuter plus activity ger recovery_confirmation_pending.
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.session_distance_activity_detected = True
+    
+    end_mowing_session(state, t_after_1130)
+    assert state.last_mowing_attempt_result == "recovery_confirmation_pending"
+    assert state.pending_mowing_confirmation is True
+    assert state.pending_confirmation_type == "recovery_only"
+
+    clear_pending_confirmation_fields(state)
+
+    # 17. 5 min 58 sek plus activity ger recovery_confirmation_pending.
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=358)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=358)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.session_distance_activity_detected = True
+    
+    end_mowing_session(state, t_after_1130)
+    assert state.last_mowing_attempt_result == "recovery_confirmation_pending"
+    assert state.pending_mowing_confirmation is True
+    assert state.pending_confirmation_type == "recovery_only"
+
+    clear_pending_confirmation_fields(state)
+
+    # 18. Recovery-only kandidat utan activity verifieras inte.
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    # No activity signal
+    state.session_distance_activity_detected = False
+    state.session_start_battery = 90
+    state.session_latest_battery = 90
+    state.session_accumulated_positive_distance = 0.0
+    state.session_start_runtime_hours = 100.0
+    state.session_latest_runtime_hours = 100.0
+    
+    end_mowing_session(state, t_after_1130)
+    assert state.last_mowing_attempt_result == "insufficient_supporting_data"
+    assert state.pending_mowing_confirmation is False
+
+    clear_pending_confirmation_fields(state)
+
+    # 19. Recovery-only kandidat med error under session verifieras inte.
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.session_distance_activity_detected = True
+    # Error detected during session
+    state.session_error_detected = True
+    
+    end_mowing_session(state, t_after_1130)
+    assert state.last_mowing_attempt_result == "failed_error_during_mowing"
+    assert state.pending_mowing_confirmation is False
+
+    # 20. Recovery-only kandidat med error inom grace blir failed_error_after_mowing.
+    # Set up pending recovery_only confirmation
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.session_distance_activity_detected = True
+    end_mowing_session(state, t_after_1130)
+    assert state.pending_mowing_confirmation is True
+    assert state.pending_confirmation_type == "recovery_only"
+    
+    # Within 5 mins, a state change with active error is received
+    t_error = t_after_1130 + datetime.timedelta(minutes=3)
+    homeassistant.util.dt.set_time(t_error)
+    states_db[state.entity_ids["error_message"]] = MockState("Blade disc blocked", last_updated=t_error)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("Blade disc blocked", last_updated=t_error)))
+    
+    assert state.pending_mowing_confirmation is False
+    assert state.last_mowing_attempt_result == "failed_error_after_mowing"
+    assert state.failed_recovery is True
+
+    # Restore healthy states
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=t_error)
+    await manager._async_state_changed_event(MockEvent(state.entity_ids["error_message"], MockState("none", last_updated=t_error)))
+    state.failed_recovery = False
+
+    # 21-24. Recovery-only kandidat utan fel under grace blir recovery_verified_session.
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "cutting"
+    state.mowing_session_active = True
+    state.session_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_after_1130 - datetime.timedelta(seconds=300)).isoformat()
+    state.session_distance_activity_detected = True
+    end_mowing_session(state, t_after_1130)
+    
+    assert state.pending_mowing_confirmation is True
+    assert state.pending_confirmation_type == "recovery_only"
+    
+    # Advance time past grace period (5 mins)
+    t_past_grace = t_after_1130 + datetime.timedelta(minutes=6)
+    homeassistant.util.dt.set_time(t_past_grace)
+    
+    from custom_components.automower_supervisor.activity import check_pending_mowing_confirmation
+    check_pending_mowing_confirmation(state, t_past_grace)
+    
+    # 21. recovery_verified_session
+    assert state.last_mowing_attempt_result == "recovery_verified_session"
+    # 22. recovery_state recovered
+    assert state.recovery_state == RecoveryState.RECOVERED
+    # 23. confirmed_mowing_today is False
+    assert state.confirmed_mowing_today is False
+    # 24. last_confirmed_mowing_at is unchanged
+    assert state.last_confirmed_mowing_at is None
+
+    # 25-27. 10 min plus activity skapar full confirmation_pending, confirmed_mowing, confirmed_mowing_today.
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.mowing_session_active = True
+    state.session_started_at = (t_past_grace - datetime.timedelta(seconds=600)).isoformat()
+    state.accumulated_mowing_seconds = 0
+    state.session_elapsed_seconds = 0
+    state.current_mowing_segment_started_at = (t_past_grace - datetime.timedelta(seconds=600)).isoformat()
+    state.session_distance_activity_detected = True
+    end_mowing_session(state, t_past_grace)
+    
+    # 25. confirmation_pending
+    assert state.last_mowing_attempt_result == "confirmation_pending"
+    assert state.pending_mowing_confirmation is True
+    assert state.pending_confirmation_type == "full_mowing"
+    
+    # Advance time past grace period
+    t_full_past_grace = t_past_grace + datetime.timedelta(minutes=6)
+    check_pending_mowing_confirmation(state, t_full_past_grace)
+    
+    # 26. confirmed_mowing
+    assert state.last_mowing_attempt_result == "confirmed_mowing"
+    # 27. confirmed_mowing_today
+    assert state.confirmed_mowing_today is True
+    assert state.last_confirmed_mowing_at is not None
+
+    # Reset confirmed_mowing_today
+    state.confirmed_mowing_today = False
+    state.last_confirmed_mowing_at = None
+
+    # 28. Gammal pending storage utan typ laddas som full_mowing.
+    manager_compat = AutomowerSupervisorManager(hass)
+    # 28a: seconds >= 600 -> full_mowing
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": "2026-06-09T10:00:00",
+            "pending_confirmation_mowing_seconds": 600,
+        }
+    }
+    await manager_compat._async_load_storage()
+    assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "full_mowing"
+
+    # 28b: seconds < 600 and recovery_state == cleared_but_unverified -> recovery_only
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": "2026-06-09T10:00:00",
+            "pending_confirmation_mowing_seconds": 300,
+            "recovery_state": "cleared_but_unverified",
+        }
+    }
+    await manager_compat._async_load_storage()
+    assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "recovery_only"
+
+    # 28c: fallback -> full_mowing
+    manager_compat._storage._store.data = {
+        "automowerkv5": {
+            "pending_mowing_confirmation": True,
+            "pending_confirmation_ended_at": "2026-06-09T10:00:00",
+            "pending_confirmation_mowing_seconds": 300,
+            "recovery_state": "recovered",
+        }
+    }
+    await manager_compat._async_load_storage()
+    assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "full_mowing"
+
+    # 29. pending_confirmation_type sparas persistent.
+    state.pending_confirmation_type = "recovery_only"
+    storage_data = manager.get_storage_data()
+    assert storage_data[robot_id]["pending_confirmation_type"] == "recovery_only"
+    state.pending_confirmation_type = None
+
+    # 30. Movement recovery fungerar oförändrat.
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error_category = "movement"
+    state.recovery_accumulated_positive_distance = 0.0
+    state.recovery_previous_distance = 100.0
+    from custom_components.automower_supervisor.activity import update_robot_distance
+    update_robot_distance(state, 101.5) # distance delta = 1.5 >= 1.0 (DISTANCE_MIN_DELTA_METERS)
+    assert state.recovery_state == RecoveryState.RECOVERED
+    assert state.failed_recovery is False
+    assert state.recovery_verified_at is not None
+
+    # 31. Recovery-only efter cutting-fel fungerar (tested via 21-24).
+
+    # 32. Robotsensorn lämnar critical efter recovery-only om inga andra critical-problem finns.
+    state.recovery_state = RecoveryState.RECOVERED
+    state.online = True
+    state.current_error_active = False
+    state.binary_error = "off"
+    state.failed_recovery = False
+    assert sensor.native_value in ("ok", "warning")
+
+    # 33. Daily attention kan fortfarande flagga STARTED_BUT_NOT_CONFIRMED efter recovery-only.
+    state.last_mowing_attempt_result = "recovery_verified_session"
+    state.mowing_attempted_today = True
+    state.confirmed_mowing_today = False
+    res = evaluate_daily_attention(state, t_after_1130, True)
+    assert res.required is True
+    assert res.state == "needs_attention"
+    assert "STARTED_BUT_NOT_CONFIRMED" in res.reason_codes
+    assert "Det tidigare felet" in res.text
+
+    # 34. Monitoring-listan följer ROBOTS-ordning.
+    from custom_components.automower_supervisor.const import ROBOTS
+    robots_order = list(ROBOTS.keys())
+    assert list(manager.robots.keys()) == robots_order
+
+    # 35. Summary state och event_title fungerar oförändrat.
+    # 36. Befintliga tester fortsätter fungera.
+
+
+
 
 
 

@@ -87,6 +87,15 @@ def format_online_suffix(online: bool | None) -> str:
     return "Online-status kan inte avgöras."
 
 
+def get_display_status(state: RobotState) -> str:
+    """Return text status before numeric status, falling back to 'saknas'."""
+    return (
+        state.current_status_plain
+        or state.current_status
+        or "saknas"
+    )
+
+
 def evaluate_daily_attention(
     state: RobotState,
     now: datetime,
@@ -94,7 +103,7 @@ def evaluate_daily_attention(
 ) -> DailyAttentionResult:
     """Evaluate rules for daily attention required check for a single robot."""
     display_name = state.display_name
-    status_str = state.current_status or "saknas"
+    status_str = get_display_status(state)
     battery_str = format_battery(state.current_battery)
     error_msg = state.last_real_error or "Okänt fel"
     online_suffix = format_online_suffix(state.online)
@@ -102,7 +111,7 @@ def evaluate_daily_attention(
     # Prepare common offline template text
     if state.online is False:
         age_str = f"för {state.source_age_minutes} minuter sedan" if state.source_age_minutes is not None else "saknas"
-        status_lbl = f"Senast kända status: {state.current_status or 'saknas'}"
+        status_lbl = f"Senast kända status: {status_str}"
         batt_lbl = f"Senast känt batteri: {state.current_battery} %" if state.current_battery is not None else "Senast känt batteri saknas"
         offline_text = f"{display_name}: Roboten är offline. Senaste användbara uppdatering var {age_str}. {status_lbl}. {batt_lbl}."
     else:
@@ -178,7 +187,37 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 5: Aktiv klippsession
+    # Rule 5: Gating before 11:30
+    if not daily_check_started(now):
+        # Om session pågår
+        if state.mowing_session_active:
+            text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
+            return DailyAttentionResult(
+                required=False,
+                state="monitoring",
+                reason_codes=["MOWING_IN_PROGRESS"],
+                text=text,
+            )
+        # Om pending confirmation finns
+        if state.pending_mowing_confirmation:
+            code = "RECOVERY_CONFIRMATION_PENDING" if state.pending_confirmation_type == "recovery_only" else "MOWING_CONFIRMATION_PENDING"
+            text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
+            return DailyAttentionResult(
+                required=False,
+                state="monitoring",
+                reason_codes=[code],
+                text=text,
+            )
+        # Övriga friska robotar
+        text = f"{display_name}: Ännu inte utvärderad för idag."
+        return DailyAttentionResult(
+            required=False,
+            state="not_evaluated",
+            reason_codes=[],
+            text=text,
+        )
+
+    # Rule 6: Aktiv klippsession
     if state.mowing_session_active:
         text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
         return DailyAttentionResult(
@@ -188,17 +227,18 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 6: Pending confirmation
+    # Rule 7: Pending confirmation
     if state.pending_mowing_confirmation:
+        code = "RECOVERY_CONFIRMATION_PENDING" if state.pending_confirmation_type == "recovery_only" else "MOWING_CONFIRMATION_PENDING"
         text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
         return DailyAttentionResult(
             required=False,
             state="monitoring",
-            reason_codes=["MOWING_CONFIRMATION_PENDING"],
+            reason_codes=[code],
             text=text,
         )
 
-    # Rule 7: Bekräftad klippning idag
+    # Rule 8: Bekräftad klippning idag
     if state.confirmed_mowing_today:
         text = f"{display_name}: Klippning har bekräftats idag."
         return DailyAttentionResult(
@@ -208,7 +248,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 8: Incomplete daily observation guard
+    # Rule 9: Incomplete daily observation guard
     if not observation_complete and not state.mowing_attempted_today:
         text = f"{display_name}: Ofullständig dagsobservation (integrationen startade efter klockan 11:30)."
         return DailyAttentionResult(
@@ -218,7 +258,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 9: Ingen start efter 11:30
+    # Rule 10: Ingen start efter 11:30
     if daily_check_started(now) and not state.mowing_attempted_today:
         text = f"{display_name}: Ingen klippsession har registrerats efter klockan 11:00 idag. Aktuell status: {status_str}. {battery_str}. {online_suffix}"
         return DailyAttentionResult(
@@ -228,7 +268,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 10: Kort försök
+    # Rule 11: Kort försök
     if state.last_mowing_attempt_result == "short_attempt":
         text = f"{display_name}: Roboten gjorde endast ett kort klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)}. Ingen bekräftad klippning har registrerats idag. Aktuell status: {status_str}."
         return DailyAttentionResult(
@@ -238,7 +278,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 11: Osäkert försök / Insufficient supporting data
+    # Rule 12: Osäkert försök / Insufficient supporting data
     if state.last_mowing_attempt_result == "uncertain_attempt":
         text = f"{display_name}: Roboten gjorde ett klippförsök på {format_duration(state.last_mowing_attempt_duration_seconds)} men aktiviteten kunde inte bekräftas. Aktuell status: {status_str}."
         return DailyAttentionResult(
@@ -256,9 +296,12 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 12: Started but not confirmed
+    # Rule 13: Started but not confirmed
     if state.mowing_attempted_today:
-        text = f"{display_name}: Klippning påbörjades idag men har inte bekräftats. Aktuell status: {status_str}."
+        if state.last_mowing_attempt_result == "recovery_verified_session":
+            text = f"{display_name}: Det tidigare felet \"{error_msg}\" har verifierats återställt efter en klippsession på {format_duration(state.last_mowing_attempt_duration_seconds)}. Dagens fullständiga klippning är ännu inte bekräftad. Aktuell status: {status_str}."
+        else:
+            text = f"{display_name}: Klippning påbörjades idag men har inte bekräftats. Aktuell status: {status_str}."
         return DailyAttentionResult(
             required=True,
             state="needs_attention",
@@ -266,7 +309,7 @@ def evaluate_daily_attention(
             text=text,
         )
 
-    # Rule 13: Default / not_evaluated (before 11:30 or other case)
+    # Default / not_evaluated
     text = f"{display_name}: Ännu inte utvärderad för idag."
     return DailyAttentionResult(
         required=False,

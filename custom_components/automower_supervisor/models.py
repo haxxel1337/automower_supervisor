@@ -88,6 +88,7 @@ class RobotState:
     pending_confirmation_distance_activity: bool = False
     pending_confirmation_runtime_activity: bool = False
     pending_confirmation_battery_activity: bool = False
+    pending_confirmation_type: str | None = None
 
     # New recovery distance tracking fields
     recovery_distance_baseline: float | None = None

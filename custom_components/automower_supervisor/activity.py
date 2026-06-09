@@ -11,6 +11,7 @@ from .models import RobotState, RecoveryState
 from .schedule import get_daily_date
 from .const import (
     MOWING_SHORT_MAX_MINUTES,
+    RECOVERY_CONFIRM_MIN_MINUTES,
     MOWING_CONFIRM_MIN_MINUTES,
     ERROR_GRACE_PERIOD_MINUTES,
     DISTANCE_MIN_DELTA_METERS,
@@ -94,6 +95,28 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
     
     now_utc = dt_util.as_utc(now)
     
+    # Calculate supporting signals first
+    has_distance_signal = (
+        state.session_accumulated_positive_distance >= DISTANCE_MIN_DELTA_METERS
+        or state.session_distance_activity_detected
+    )
+    
+    has_runtime_signal = False
+    if (state.session_start_runtime_hours is not None and 
+        state.session_latest_runtime_hours is not None):
+        delta = state.session_latest_runtime_hours - state.session_start_runtime_hours
+        if delta >= RUNTIME_MIN_DELTA_HOURS:
+            has_runtime_signal = True
+            
+    has_battery_signal = False
+    if (state.session_start_battery is not None and 
+        state.session_latest_battery is not None):
+        delta = state.session_start_battery - state.session_latest_battery
+        if delta >= BATTERY_MIN_DROP_PERCENT:
+            has_battery_signal = True
+            
+    has_supporting_activity = has_distance_signal or has_runtime_signal or has_battery_signal
+
     # Classify session result
     if state.session_error_detected or state.session_binary_error_detected:
         result = "failed_error_during_mowing"
@@ -103,10 +126,23 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
         mowing_minutes = state.accumulated_mowing_seconds / 60.0
         if mowing_minutes < MOWING_SHORT_MAX_MINUTES:
             result = "short_attempt"
-        elif mowing_minutes < MOWING_CONFIRM_MIN_MINUTES:
+        elif mowing_minutes < RECOVERY_CONFIRM_MIN_MINUTES:
             result = "uncertain_attempt"
+        elif mowing_minutes < MOWING_CONFIRM_MIN_MINUTES:
+            # 5 to under 10 minutes
+            if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED and has_supporting_activity:
+                result = "recovery_confirmation_pending"
+            else:
+                if has_supporting_activity:
+                    result = "uncertain_attempt"
+                else:
+                    result = "insufficient_supporting_data"
         else:
-            result = "confirmation_pending"
+            # 10 minutes or more
+            if has_supporting_activity:
+                result = "confirmation_pending"
+            else:
+                result = "insufficient_supporting_data"
             
     # Save last attempt data
     state.last_mowing_attempt_at = state.session_started_at
@@ -116,38 +152,21 @@ def end_mowing_session(state: RobotState, now: datetime, result_override: str | 
     
     storage_changed = True
     
-    if result == "confirmation_pending":
-        # Check supporting signals
-        has_distance_signal = (
-            state.session_accumulated_positive_distance >= DISTANCE_MIN_DELTA_METERS
-            or state.session_distance_activity_detected
-        )
+    if result in ("recovery_confirmation_pending", "confirmation_pending"):
+        state.pending_mowing_confirmation = True
+        state.pending_confirmation_ended_at = now_utc.isoformat()
+        state.pending_confirmation_mowing_seconds = state.accumulated_mowing_seconds
+        state.pending_confirmation_session_elapsed_seconds = state.session_elapsed_seconds
+        state.pending_confirmation_distance_activity = has_distance_signal
+        state.pending_confirmation_runtime_activity = has_runtime_signal
+        state.pending_confirmation_battery_activity = has_battery_signal
         
-        has_runtime_signal = False
-        if (state.session_start_runtime_hours is not None and 
-            state.session_latest_runtime_hours is not None):
-            delta = state.session_latest_runtime_hours - state.session_start_runtime_hours
-            if delta >= RUNTIME_MIN_DELTA_HOURS:
-                has_runtime_signal = True
-                
-        has_battery_signal = False
-        if (state.session_start_battery is not None and 
-            state.session_latest_battery is not None):
-            delta = state.session_start_battery - state.session_latest_battery
-            if delta >= BATTERY_MIN_DROP_PERCENT:
-                has_battery_signal = True
-                
-        if has_distance_signal or has_runtime_signal or has_battery_signal:
-            state.pending_mowing_confirmation = True
-            state.pending_confirmation_ended_at = now_utc.isoformat()
-            state.pending_confirmation_mowing_seconds = state.accumulated_mowing_seconds
-            state.pending_confirmation_session_elapsed_seconds = state.session_elapsed_seconds
-            state.pending_confirmation_distance_activity = has_distance_signal
-            state.pending_confirmation_runtime_activity = has_runtime_signal
-            state.pending_confirmation_battery_activity = has_battery_signal
-            state.last_mowing_attempt_result = "confirmation_pending"
+        if result == "recovery_confirmation_pending":
+            state.pending_confirmation_type = "recovery_only"
+            state.last_mowing_attempt_result = "recovery_confirmation_pending"
         else:
-            state.last_mowing_attempt_result = "insufficient_supporting_data"
+            state.pending_confirmation_type = "full_mowing"
+            state.last_mowing_attempt_result = "confirmation_pending"
     else:
         state.last_mowing_attempt_result = result
         if result == "failed_error_during_mowing":
@@ -190,6 +209,7 @@ def clear_pending_confirmation_fields(state: RobotState) -> None:
     state.pending_confirmation_distance_activity = False
     state.pending_confirmation_runtime_activity = False
     state.pending_confirmation_battery_activity = False
+    state.pending_confirmation_type = None
 
 
 def get_pending_confirmation_age_seconds(state: RobotState, now: datetime) -> float | None:
@@ -217,18 +237,28 @@ def confirm_pending_mowing(state: RobotState, now: datetime) -> bool:
         return False
         
     now_utc = dt_util.as_utc(now)
-    state.last_mowing_attempt_result = "confirmed_mowing"
-    state.last_confirmed_mowing_at = state.pending_confirmation_ended_at
-    state.last_confirmed_mowing_duration_seconds = state.pending_confirmation_mowing_seconds
-    state.confirmed_mowing_today = True
+    conf_type = state.pending_confirmation_type or "full_mowing"
     
-    # Verify recovery if cleared but unverified and error category is cutting, other, or none
-    if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-        if state.last_real_error_category in ("cutting", "other", "none"):
-            state.recovery_state = RecoveryState.RECOVERED
-            state.failed_recovery = False
-            state.recovery_verified_at = now_utc.isoformat()
-            
+    if conf_type == "full_mowing":
+        state.last_mowing_attempt_result = "confirmed_mowing"
+        state.last_confirmed_mowing_at = state.pending_confirmation_ended_at
+        state.last_confirmed_mowing_duration_seconds = state.pending_confirmation_mowing_seconds
+        state.confirmed_mowing_today = True
+        
+        # Verify recovery if cleared but unverified and error category is cutting, other, or none
+        if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+            if state.last_real_error_category in ("cutting", "other", "none"):
+                state.recovery_state = RecoveryState.RECOVERED
+                state.failed_recovery = False
+                state.recovery_verified_at = now_utc.isoformat()
+    else:  # recovery_only
+        state.last_mowing_attempt_result = "recovery_verified_session"
+        if state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+            if state.last_real_error_category in ("cutting", "other", "none"):
+                state.recovery_state = RecoveryState.RECOVERED
+                state.failed_recovery = False
+                state.recovery_verified_at = now_utc.isoformat()
+                
     clear_pending_confirmation_fields(state)
     return True
 

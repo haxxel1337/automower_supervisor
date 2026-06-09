@@ -257,6 +257,16 @@ class AutomowerSupervisorManager:
             state.pending_confirmation_distance_activity = bool(data.get("pending_confirmation_distance_activity", False))
             state.pending_confirmation_runtime_activity = bool(data.get("pending_confirmation_runtime_activity", False))
             state.pending_confirmation_battery_activity = bool(data.get("pending_confirmation_battery_activity", False))
+            state.pending_confirmation_type = data.get("pending_confirmation_type")
+            if state.pending_mowing_confirmation and state.pending_confirmation_type is None:
+                mow_secs = state.pending_confirmation_mowing_seconds
+                if mow_secs >= 600:
+                    state.pending_confirmation_type = "full_mowing"
+                elif state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+                    state.pending_confirmation_type = "recovery_only"
+                else:
+                    _LOGGER.info("Old pending confirmation type not found for robot %s. Falling back to full_mowing.", robot_id)
+                    state.pending_confirmation_type = "full_mowing"
             
             state.recovery_distance_baseline = data.get("recovery_distance_baseline")
             state.recovery_accumulated_positive_distance = float(data.get("recovery_accumulated_positive_distance", 0.0))
@@ -300,6 +310,7 @@ class AutomowerSupervisorManager:
                 "pending_confirmation_distance_activity": state.pending_confirmation_distance_activity,
                 "pending_confirmation_runtime_activity": state.pending_confirmation_runtime_activity,
                 "pending_confirmation_battery_activity": state.pending_confirmation_battery_activity,
+                "pending_confirmation_type": state.pending_confirmation_type,
                 "recovery_distance_baseline": state.recovery_distance_baseline,
                 "recovery_accumulated_positive_distance": state.recovery_accumulated_positive_distance,
                 "recovery_previous_distance": state.recovery_previous_distance,
@@ -862,7 +873,7 @@ class AutomowerSupervisorManager:
             "last_evaluated_at": now.isoformat(),
             "schedule_check_started": daily_check_started(now),
             "schedule_finished": daily_schedule_finished(now),
-            "monitoring_names": sorted(monitoring_names),
+            "monitoring_names": monitoring_names,
             "monitoring_count": len(monitoring_names),
         }
         

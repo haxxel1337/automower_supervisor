@@ -293,6 +293,7 @@ class AutomowerRobotSensor(SensorEntity):
             "pending_confirmation_distance_activity": state_data.pending_confirmation_distance_activity,
             "pending_confirmation_runtime_activity": state_data.pending_confirmation_runtime_activity,
             "pending_confirmation_battery_activity": state_data.pending_confirmation_battery_activity,
+            "pending_confirmation_type": state_data.pending_confirmation_type,
             "distance_reset_count": state_data.distance_reset_count,
             # Last Attempt / Confirmed
             "last_mowing_attempt_at": state_data.last_mowing_attempt_at,
