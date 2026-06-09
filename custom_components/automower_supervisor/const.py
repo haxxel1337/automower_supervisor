@@ -1,0 +1,45 @@
+"""Constants for the Automower Supervisor integration."""
+
+DOMAIN = "automower_supervisor"
+
+ROBOTS = {
+    "automowerkv5": "Kv5",
+    "automowertuv4": "Tuv4",
+    "automowervv14mini": "Vv14 Mini",
+    "automowervv14big": "Vv14 Big",
+    "automowervv18": "Vv18",
+    "automoweralmv3": "Alm V3",
+    "automowerbd17": "Bd17",
+    "automowersbv14": "Sbv14",
+    "automowervv2": "Vv2",
+    "automowertrv4": "Trv4",
+    "automowerlv9": "Lv9",
+}
+
+ENTITY_PATTERNS = {
+    "main": "lawn_mower.{robot}_automower",
+    "status": "sensor.{robot}_mower_status",
+    "status_plain": "sensor.{robot}_mower_status_plain",
+    "substatus": "sensor.{robot}_mower_substatus",
+    "status_duration": "sensor.{robot}_mower_status_duration",
+    "battery": "sensor.{robot}_mower_battery_charge",
+    "distance": "sensor.{robot}_mower_distance",
+    "statistic_hours": "sensor.{robot}_mower_statistic_hours",
+    "error_message": "sensor.{robot}_mower_error_message",
+    "error_binary": "binary_sensor.{robot}_mower_error",
+    "clock": "sensor.{robot}_clock_time",
+    "battery_0": "sensor.{robot}_battery_0",
+}
+
+NO_ACTIVE_ERROR_VALUES = {
+    "",
+    "0",
+    "fault 0",
+    "none",
+    "no error",
+    "unknown",
+    "unavailable",
+}
+
+STORAGE_KEY = "automower_supervisor.storage"
+STORAGE_VERSION = 1

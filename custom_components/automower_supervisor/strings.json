@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Automower Supervisor",
+        "description": "Install local monitoring for the configured robotic lawn mowers."
+      }
+    },
+    "abort": {
+      "already_configured": "Service is already configured."
+    }
+  }
+}

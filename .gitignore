@@ -1,0 +1,12 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Linter and IDEs
+.ruff_cache/
+.vscode/
+.idea/
+
+# Local/temp files
+automower_supervisor_v0.1.0.zip
