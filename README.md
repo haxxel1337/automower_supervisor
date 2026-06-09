@@ -14,7 +14,7 @@ Automower Supervisor is a local Home Assistant custom integration that aggregate
   - `automowervv14mini` (Vv14 Mini)
   - `automowervv14big` (Vv14 Big)
   - `automowervv18` (Vv18)
-  - `automoweralmv3` (Alm V3)
+  - `automoweralmv3` (Almv3)
   - `automowerbd17` (Bd17)
   - `automowersbv14` (Sbv14)
   - `automowervv2` (Vv2)
