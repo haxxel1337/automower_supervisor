@@ -2995,6 +2995,179 @@ async def test_version_0_4_2_scenarios() -> None:
     # 30. Befintliga tester fortsätter fungera.
 
 
+@pytest.mark.asyncio
+async def test_version_0_4_3_scenarios() -> None:
+    """Comprehensive tests for version 0.4.3 requirements."""
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    states_db = {}
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    robot_id = "automowerkv5"
+    state = manager.robots[robot_id]
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    
+    # Base timestamp: 2026-06-09 12:00:00 UTC (14:00:00 Stockholm)
+    t_today = datetime.datetime(2026, 6, 9, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    t_yesterday = t_today - datetime.timedelta(days=1)
+    homeassistant.util.dt.set_time(t_today)
+    
+    states_db[state.entity_ids["clock"]] = MockState("12:00", last_updated=t_today)
+    states_db[state.entity_ids["status"]] = MockState("Sleeping", last_updated=t_today)
+    states_db[state.entity_ids["status_plain"]] = MockState("sleeping", last_updated=t_today)
+    states_db[state.entity_ids["battery"]] = MockState("100", last_updated=t_today)
+    states_db[state.entity_ids["distance"]] = MockState("1000", last_updated=t_today)
+    states_db[state.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=t_today)
+    states_db[state.entity_ids["error_message"]] = MockState("none", last_updated=t_today)
+    states_db[state.entity_ids["error_binary"]] = MockState("off", last_updated=t_today)
+    
+    manager.sync_initial_states()
+    
+    # 1. Gårdagens uncertain_attempt ger inte warning idag.
+    state.last_mowing_attempt_result = "uncertain_attempt"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    state.online = True
+    assert sensor.native_value == "ok"
+    
+    # 2. Dagens uncertain_attempt ger warning.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "warning"
+    assert "MOWING_ATTEMPT_UNCERTAIN" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 3. Gårdagens short_attempt ger inte attempt-warning idag.
+    state.last_mowing_attempt_result = "short_attempt"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert sensor.native_value == "ok"
+    
+    # 4. Dagens short_attempt ger warning.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "warning"
+    assert "MOWING_ATTEMPT_SHORT" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 5. Gårdagens session_lost_offline ger inte warning om roboten är online idag.
+    state.last_mowing_attempt_result = "session_lost_offline"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert sensor.native_value == "ok"
+    
+    # 6. Dagens session_lost_offline ger warning.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "warning"
+    assert "MOWING_SESSION_LOST_OFFLINE" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 7. Gårdagens failed_error_during_mowing ger inte attempt-reason idag när inget aktuellt fel finns.
+    state.last_mowing_attempt_result = "failed_error_during_mowing"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "ERROR_DURING_MOWING" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 8. Dagens failed_error_during_mowing ger attempt-reason.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "ERROR_DURING_MOWING" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 9. Gårdagens failed_error_after_mowing filtreras bort.
+    state.last_mowing_attempt_result = "failed_error_after_mowing"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "ERROR_AFTER_MOWING" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 10. Dagens failed_error_after_mowing visas.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "ERROR_AFTER_MOWING" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 11. Gårdagens insufficient_supporting_data filtreras bort.
+    state.last_mowing_attempt_result = "insufficient_supporting_data"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "NO_SUPPORTING_ACTIVITY" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 12. Dagens insufficient_supporting_data ger reason codes.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "NO_SUPPORTING_ACTIVITY" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 13. Gårdagens recovery_verified_session ger inte RECOVERY_VERIFIED_SESSION.
+    state.last_mowing_attempt_result = "recovery_verified_session"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "RECOVERY_VERIFIED_SESSION" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 14. Dagens recovery_verified_session ger reason code.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert "RECOVERY_VERIFIED_SESSION" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 15. Gårdagens recovery_confirmation_invalid filtreras bort.
+    state.last_mowing_attempt_result = "recovery_confirmation_invalid"
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert "RECOVERY_CONFIRMATION_INVALID" not in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 16. Dagens recovery_confirmation_invalid ger warning och reason code.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.native_value == "warning"
+    assert "RECOVERY_CONFIRMATION_INVALID" in sensor.extra_state_attributes["assessment_reasons"]
+    
+    # 17. Pending confirmation visas oavsett attempt-datum.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    state.pending_mowing_confirmation = True
+    state.pending_confirmation_type = "recovery_only"
+    assert "PENDING_MOWING_CONFIRMATION" in sensor.extra_state_attributes["assessment_reasons"]
+    assert "RECOVERY_CONFIRMATION_PENDING" in sensor.extra_state_attributes["assessment_reasons"]
+    state.pending_mowing_confirmation = False
+    state.pending_confirmation_type = None
+    
+    # 18. Active error visas oavsett attempt-datum.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    state.current_error_active = True
+    assert sensor.native_value == "critical"
+    state.current_error_active = False
+    
+    # 19. Cleared but unverified visas oavsett attempt-datum.
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    assert sensor.native_value == "critical"
+    state.recovery_state = RecoveryState.NONE
+    
+    # 20. Failed recovery visas oavsett attempt-datum.
+    state.failed_recovery = True
+    assert sensor.native_value == "critical"
+    state.failed_recovery = False
+    
+    # 21. Offline visas oavsett attempt-datum.
+    state.online = False
+    assert sensor.native_value == "critical"
+    state.online = True
+    
+    # 22. Aktiv klippsession visas oavsett attempt-datum.
+    state.mowing_session_active = True
+    assert "MOWING_SESSION_ACTIVE" in sensor.extra_state_attributes["assessment_reasons"]
+    state.mowing_session_active = False
+    
+    # 23. mowing_attempted_today under aktivt schema ger warning som tidigare.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    state.last_mowing_attempt_result = "ok_result"
+    state.mowing_attempted_today = True
+    state.confirmed_mowing_today = False
+    assert sensor.native_value == "warning"
+    
+    # 24. last_attempt_is_today blir true för dagens attempt.
+    state.last_mowing_ended_at = t_today.isoformat()
+    assert sensor.extra_state_attributes["last_attempt_is_today"] is True
+    
+    # 25. last_attempt_is_today blir false för gårdagens attempt.
+    state.last_mowing_ended_at = t_yesterday.isoformat()
+    assert sensor.extra_state_attributes["last_attempt_is_today"] is False
+    
+    # 26. Ogiltig ISO-tid kraschar inte sensorn.
+    state.last_mowing_ended_at = "banana-time"
+    assert sensor.native_value is not None
+    assert sensor.extra_state_attributes["last_attempt_is_today"] is False
+    
+    # 27. Saknade tider kraschar inte sensorn.
+    state.last_mowing_ended_at = None
+    state.last_mowing_attempt_at = None
+    assert sensor.native_value is not None
+    assert sensor.extra_state_attributes["last_attempt_is_today"] is False
+
+
+
 
 
 

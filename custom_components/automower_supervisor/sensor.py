@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from datetime import datetime
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -16,6 +17,7 @@ from .const import DOMAIN, NO_ACTIVE_ERROR_VALUES
 from .manager import AutomowerSupervisorManager, get_robot_suffix
 from .models import RecoveryState
 from .schedule import is_scheduled_now
+from .daily_assessment import is_attempt_from_today
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +80,8 @@ class AutomowerRobotSensor(SensorEntity):
     def native_value(self) -> str:
         """Return the state of the sensor."""
         state_data = self.manager.robots[self.robot_id]
+        now = dt_util.now()
+        attempt_is_today = is_attempt_from_today(state_data, now)
 
         # 1. Critical state (active error or cleared but unverified or failed recovery or offline)
         is_critical = (
@@ -115,12 +119,25 @@ class AutomowerRobotSensor(SensorEntity):
         if available_count < 2:
             return "insufficient_data"
 
-        # 4. Warning state due to uncertain mowing session attempts
-        if state_data.last_mowing_attempt_result in ("uncertain_attempt", "interrupted_searching", "session_lost_offline"):
+        # 4. Warning state due to uncertain mowing session attempts (only if attempt is from today)
+        attempt_warning_results = {
+            "short_attempt",
+            "uncertain_attempt",
+            "interrupted_searching",
+            "session_lost_offline",
+            "insufficient_supporting_data",
+            "failed_error_during_mowing",
+            "failed_error_after_mowing",
+            "recovery_confirmation_invalid",
+        }
+        if (
+            attempt_is_today
+            and state_data.last_mowing_attempt_result in attempt_warning_results
+        ):
             return "warning"
 
         # 5. Warning state if schedule active, attempted but not confirmed today
-        if is_scheduled_now(dt_util.now()):
+        if is_scheduled_now(now):
             if state_data.mowing_attempted_today and not state_data.confirmed_mowing_today:
                 return "warning"
 
@@ -138,6 +155,8 @@ class AutomowerRobotSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return details about the assessment reasons and sub-entity states."""
         state_data = self.manager.robots[self.robot_id]
+        now = dt_util.now()
+        attempt_is_today = is_attempt_from_today(state_data, now)
 
         # Determine assessment reasons
         reasons: list[str] = []
@@ -192,24 +211,34 @@ class AutomowerRobotSensor(SensorEntity):
         if state_data.mowing_session_active:
             reasons.append("MOWING_SESSION_ACTIVE")
             
-        if state_data.last_mowing_attempt_result == "short_attempt":
-            reasons.append("MOWING_ATTEMPT_SHORT")
-        elif state_data.last_mowing_attempt_result == "uncertain_attempt":
-            reasons.append("MOWING_ATTEMPT_UNCERTAIN")
-        elif state_data.last_mowing_attempt_result == "interrupted_searching":
-            reasons.append("MOWING_INTERRUPTED_SEARCHING")
-        elif state_data.last_mowing_attempt_result == "confirmed_mowing":
-            reasons.append("CONFIRMED_MOWING")
-        elif state_data.last_mowing_attempt_result == "failed_error_during_mowing":
-            reasons.append("ERROR_DURING_MOWING")
-        elif state_data.last_mowing_attempt_result == "failed_error_after_mowing":
-            reasons.append("ERROR_AFTER_MOWING")
-        elif state_data.last_mowing_attempt_result == "insufficient_supporting_data":
-            reasons.append("NO_SUPPORTING_ACTIVITY")
-            reasons.append("NO_DISTANCE_CHANGE")
-            reasons.append("NO_RUNTIME_CHANGE")
+        if attempt_is_today:
+            if state_data.last_mowing_attempt_result == "short_attempt":
+                reasons.append("MOWING_ATTEMPT_SHORT")
+            elif state_data.last_mowing_attempt_result == "uncertain_attempt":
+                reasons.append("MOWING_ATTEMPT_UNCERTAIN")
+            elif state_data.last_mowing_attempt_result == "interrupted_searching":
+                reasons.append("MOWING_INTERRUPTED_SEARCHING")
+            elif state_data.last_mowing_attempt_result == "confirmed_mowing":
+                reasons.append("CONFIRMED_MOWING")
+            elif state_data.last_mowing_attempt_result == "failed_error_during_mowing":
+                reasons.append("ERROR_DURING_MOWING")
+            elif state_data.last_mowing_attempt_result == "failed_error_after_mowing":
+                reasons.append("ERROR_AFTER_MOWING")
+            elif state_data.last_mowing_attempt_result == "insufficient_supporting_data":
+                reasons.append("NO_SUPPORTING_ACTIVITY")
+                reasons.append("NO_DISTANCE_CHANGE")
+                reasons.append("NO_RUNTIME_CHANGE")
+            elif state_data.last_mowing_attempt_result == "recovery_verified_session":
+                reasons.append("RECOVERY_VERIFIED_SESSION")
+            elif state_data.last_mowing_attempt_result == "recovery_confirmation_invalid":
+                reasons.append("RECOVERY_CONFIRMATION_INVALID")
+            elif state_data.last_mowing_attempt_result == "session_lost_offline":
+                reasons.append("MOWING_SESSION_LOST_OFFLINE")
             
-        if is_scheduled_now(dt_util.now()):
+        if state_data.confirmed_mowing_today:
+            reasons.append("CONFIRMED_MOWING_TODAY")
+            
+        if is_scheduled_now(now):
             if state_data.mowing_attempted_today and not state_data.confirmed_mowing_today:
                 reasons.append("MOWING_NOT_CONFIRMED")
                 
@@ -228,12 +257,6 @@ class AutomowerRobotSensor(SensorEntity):
             
         if state_data.last_mowing_attempt_result == "confirmation_pending":
             reasons.append("CONFIRMATION_PENDING")
-        if state_data.last_mowing_attempt_result == "recovery_verified_session":
-            reasons.append("RECOVERY_VERIFIED_SESSION")
-        if state_data.last_mowing_attempt_result == "recovery_confirmation_invalid":
-            reasons.append("RECOVERY_CONFIRMATION_INVALID")
-        if state_data.last_mowing_attempt_result == "session_lost_offline":
-            reasons.append("MOWING_SESSION_LOST_OFFLINE")
         if state_data.distance_reset_count > 0:
             reasons.append("DISTANCE_RESET_DETECTED")
         if state_data.interruption_status is not None:
@@ -279,7 +302,7 @@ class AutomowerRobotSensor(SensorEntity):
             "watchdog_checked_at": self.manager.watchdog_checked_at,
             "source_values_stale": source_values_stale,
             # Schedule properties
-            "scheduled_now": is_scheduled_now(dt_util.now()),
+            "scheduled_now": is_scheduled_now(now),
             "schedule_start": 11,
             "schedule_end": 18,
             "schedule_timezone": "Europe/Stockholm",
@@ -314,6 +337,7 @@ class AutomowerRobotSensor(SensorEntity):
             "last_confirmed_mowing_duration_seconds": state_data.last_confirmed_mowing_duration_seconds,
             "confirmed_mowing_today": state_data.confirmed_mowing_today,
             "mowing_attempted_today": state_data.mowing_attempted_today,
+            "last_attempt_is_today": attempt_is_today,
             # Supporting activity deltas
             "last_distance_value": state_data.last_distance_value,
             "last_distance_change_at": state_data.last_distance_change_at,
@@ -329,18 +353,18 @@ class AutomowerRobotSensor(SensorEntity):
             "daily_attention_reason_codes": state_data.daily_attention_reason_codes,
             "daily_attention_text": state_data.daily_attention_text,
             "daily_attention_evaluated_at": state_data.daily_attention_evaluated_at,
-            "daily_check_started": self._get_daily_check_started(),
-            "daily_schedule_finished": self._get_daily_schedule_finished(),
+            "daily_check_started": self._get_daily_check_started(now),
+            "daily_schedule_finished": self._get_daily_schedule_finished(now),
             "daily_observation_complete": self.manager.daily_observation_complete,
         }
 
-    def _get_daily_check_started(self) -> bool:
+    def _get_daily_check_started(self, now: datetime) -> bool:
         from .daily_assessment import daily_check_started
-        return daily_check_started(dt_util.now())
+        return daily_check_started(now)
 
-    def _get_daily_schedule_finished(self) -> bool:
+    def _get_daily_schedule_finished(self, now: datetime) -> bool:
         from .daily_assessment import daily_schedule_finished
-        return daily_schedule_finished(dt_util.now())
+        return daily_schedule_finished(now)
 
 
 class AutomowerDiscoverySensor(SensorEntity):
