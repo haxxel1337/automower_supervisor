@@ -1,6 +1,13 @@
-# Automower Supervisor v0.5.2
+# Automower Supervisor v0.5.3
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.3
+
+- **Consolidated Calendar Safety Release**: Includes the persistent diagnostics from 0.5.1 and the safe in-place calendar update behavior from 0.5.2 in one verified release.
+- **Verified Calendar Failure Handling**: Tests cover create, update, and delete failures and confirm that existing managed events are preserved whenever an operation fails.
+- **Test Suite Cleanup**: Corrects calendar scenario numbering and updates obsolete `replaced` terminology to the current `updated` result code.
+- **Regression Verification**: The full local test suite passes with all 19 tests successful.
 
 ## Improvements in version 0.5.2
 

@@ -3941,7 +3941,7 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 28 - Existing marker event updated/replaced
     # ----------------------------------------------------
-    # Covered by "replaced" result in idempotence test above.
+    # Covered by the "updated" result in the idempotence test above.
     
     # ----------------------------------------------------
     # Scenario 29 - 0 matching events -> created
@@ -4130,20 +4130,20 @@ async def test_version_0_5_2_scenarios() -> None:
     # Checked by get_stockholm_timezone returning Europe/Stockholm and setting tzinfo.
     
     # ----------------------------------------------------
-    # Scenario 38 - Daylight savings time handled correctly
+    # Scenario 39 - Daylight savings time handled correctly
     # ----------------------------------------------------
     # Covered by Europe/Stockholm DST transitions in zoneinfo/pytz.
     
     # ----------------------------------------------------
-    # Scenario 39 - Evening 23:59 gets correct target date (next day)
+    # Scenario 40 - Evening 23:59 gets correct target date (next day)
     # ----------------------------------------------------
     t_late = datetime.datetime(2026, 6, 9, 23, 59, 0, tzinfo=tz)
     res = await manager.async_run_evening_calendar_sync(t_late)
-    assert res in ("created", "replaced")
+    assert res in ("created", "updated")
     assert manager.calendar_snapshot.target_calendar_date == "2026-06-10"
     
     # ----------------------------------------------------
-    # Scenario 40 - Missed evening sync catch-up at HA startup
+    # Scenario 41 - Missed evening sync catch-up at HA startup
     # ----------------------------------------------------
     manager.last_evening_sync_at = "2026-06-08T20:00:00"
     t_startup_ev = datetime.datetime(2026, 6, 9, 20, 15, 0, tzinfo=tz)
@@ -4155,7 +4155,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert manager.last_evening_sync_at.startswith("2026-06-09T20:15:00")
     
     # ----------------------------------------------------
-    # Scenario 41 - Missed morning sync catch-up at HA startup
+    # Scenario 42 - Missed morning sync catch-up at HA startup
     # ----------------------------------------------------
     manager.last_morning_sync_at = "2026-06-09T11:20:00"
     t_startup_mo = datetime.datetime(2026, 6, 10, 11, 35, 0, tzinfo=tz)
@@ -4165,7 +4165,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert manager.last_morning_sync_at.startswith("2026-06-10T11:35:00")
     
     # ----------------------------------------------------
-    # Scenario 42 - Cutoff for morning sync catch-up
+    # Scenario 43 - Cutoff for morning sync catch-up
     # ----------------------------------------------------
     manager.last_morning_sync_at = "2026-06-09T11:20:00"
     t_startup_cutoff = datetime.datetime(2026, 6, 10, 14, 0, 0, tzinfo=tz)
@@ -4175,7 +4175,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert manager.last_morning_sync_at == "2026-06-09T11:20:00"
     
     # ----------------------------------------------------
-    # Scenario 43 - Timers unsubscribed on unload
+    # Scenario 44 - Timers unsubscribed on unload
     # ----------------------------------------------------
     mock_timer = MagicMock()
     manager._unsub_calendar_timers = [mock_timer]
@@ -4184,13 +4184,13 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(manager._unsub_calendar_timers) == 0
     
     # ----------------------------------------------------
-    # Scenario 44 - Sync lock blocks concurrent runs
+    # Scenario 45 - Sync lock blocks concurrent runs
     # ----------------------------------------------------
     await manager.async_setup()
     assert manager._calendar_sync_lock is not None
     
     # ----------------------------------------------------
-    # Scenario 45 - Storage loads correctly (including snapshots)
+    # Scenario 46 - Storage loads correctly (including snapshots)
     # ----------------------------------------------------
     manager_compat = AutomowerSupervisorManager(hass)
     manager_compat._storage._store.data = {
@@ -4229,7 +4229,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(manager_compat.calendar_snapshot.robots) == 1
     
     # ----------------------------------------------------
-    # Scenario 46 - Storage backwards compatibility load legacy file
+    # Scenario 47 - Storage backwards compatibility load legacy file
     # ----------------------------------------------------
     manager_legacy = AutomowerSupervisorManager(hass)
     manager_legacy._storage._store.data = {
@@ -4244,22 +4244,22 @@ async def test_version_0_5_2_scenarios() -> None:
     assert manager_legacy.calendar_snapshot is None
     
     # ----------------------------------------------------
-    # Scenario 47 - Snapshot persists across restarts
+    # Scenario 48 - Snapshot persists across restarts
     # ----------------------------------------------------
     # Covered by load storage assertions in S45.
     
     # ----------------------------------------------------
-    # Scenario 48 - Event cache persists across restarts
+    # Scenario 49 - Event cache persists across restarts
     # ----------------------------------------------------
     assert manager_compat.event_cache.get("uid") == "cached-uid"
     
     # ----------------------------------------------------
-    # Scenario 49 - Sync result metadata persists across restarts
+    # Scenario 50 - Sync result metadata persists across restarts
     # ----------------------------------------------------
     assert manager_compat.last_morning_sync_at == "2026-06-10T11:20:00"
     
     # ----------------------------------------------------
-    # Scenario 50 - Corrupt storage snapshot handled safely
+    # Scenario 51 - Corrupt storage snapshot handled safely
     # ----------------------------------------------------
     manager_corrupt = AutomowerSupervisorManager(hass)
     manager_corrupt._storage._store.data = {
@@ -4273,7 +4273,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert manager_corrupt.calendar_snapshot is None
     
     # ----------------------------------------------------
-    # Scenario 51 - Storage snapshot for old date is ignored
+    # Scenario 52 - Storage snapshot for old date is ignored
     # ----------------------------------------------------
     from custom_components.automower_supervisor.calendar_sync import EveningAttentionSnapshot
     manager.calendar_snapshot = EveningAttentionSnapshot(
@@ -4286,7 +4286,7 @@ async def test_version_0_5_2_scenarios() -> None:
     for r_id in manager.robots:
         manager.robots[r_id].online = True
 
-    # Ensure KV5 is critical so the event is replaced, not deleted
+    # Ensure KV5 is critical so the event is updated, not deleted
     manager.robots["automowerkv5"].current_error_active = True
 
     manager.robots["automowertuv4"].current_status_plain = "Sleeping"
@@ -4297,7 +4297,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert "Tuv4" not in event.summary
     
     # ----------------------------------------------------
-    # Scenario 52 - Manual service call: sync_calendar (evening)
+    # Scenario 53 - Manual service call: sync_calendar (evening)
     # ----------------------------------------------------
     manager.robots["automowerkv5"].daily_attention_required = True
     created_events.clear()
@@ -4310,7 +4310,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(mock_cal_entity.events) == 1
     
     # ----------------------------------------------------
-    # Scenario 53 - Manual service call: sync_calendar (morning)
+    # Scenario 54 - Manual service call: sync_calendar (morning)
     # ----------------------------------------------------
     mock_cal_entity.events.clear()
     service_call.data = {"mode": "morning"}
@@ -4319,7 +4319,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(mock_cal_entity.events) == 1
     
     # ----------------------------------------------------
-    # Scenario 54 - Manual service call: sync_calendar (auto)
+    # Scenario 55 - Manual service call: sync_calendar (auto)
     # ----------------------------------------------------
     service_call.data = {"mode": "auto"}
     mock_cal_entity.events.clear()
@@ -4328,13 +4328,13 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(mock_cal_entity.events) == 1
     
     # ----------------------------------------------------
-    # Scenario 55 - Service: delete_managed_calendar_event
+    # Scenario 56 - Service: delete_managed_calendar_event
     # ----------------------------------------------------
     await registered_services["automower_supervisor.delete_managed_calendar_event"](None)
     assert len(mock_cal_entity.events) == 0
     
     # ----------------------------------------------------
-    # Scenario 56 - Option reload registers new timers
+    # Scenario 57 - Option reload registers new timers
     # ----------------------------------------------------
     from custom_components.automower_supervisor import async_reload_entry
     hass.config_entries.async_reload = AsyncMock()
@@ -4343,7 +4343,7 @@ async def test_version_0_5_2_scenarios() -> None:
     await async_reload_entry(hass, mock_entry)
     
     # ----------------------------------------------------
-    # Scenario 57 - Empty calendar disables sync without error
+    # Scenario 58 - Empty calendar disables sync without error
     # ----------------------------------------------------
     mock_entry.options["calendar_enabled"] = False
     manager_disabled = AutomowerSupervisorManager(hass)
@@ -4353,7 +4353,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert res == "disabled"
     
     # ----------------------------------------------------
-    # Scenario 58 - Expose calendar attributes on summary sensor
+    # Scenario 59 - Expose calendar attributes on summary sensor
     # ----------------------------------------------------
     from custom_components.automower_supervisor.sensor import AutomowerSupervisorSummarySensor
     mock_entry.options["calendar_enabled"] = True
@@ -4374,7 +4374,7 @@ async def test_version_0_5_2_scenarios() -> None:
     assert attrs["calendar_event_title"] == "Bot Kv5"
     
     # ----------------------------------------------------
-    # Scenario 59 - Existing robot, recovery, and summary tests pass
+    # Scenario 60 - Existing robot, recovery, and summary tests pass
     # ----------------------------------------------------
     # Verified by standalone pytest runner.
 
