@@ -253,6 +253,154 @@ def evaluate_morning_resolution(
     )
 
 
+
+def _timestamp_is_after(value: str | None, reference: str) -> bool:
+    """Return True when an ISO timestamp is strictly after the reference."""
+    if not value:
+        return False
+    try:
+        value_dt = datetime.fromisoformat(value)
+        reference_dt = datetime.fromisoformat(reference)
+        if value_dt.tzinfo is None:
+            value_dt = dt_util.as_utc(value_dt)
+        if reference_dt.tzinfo is None:
+            reference_dt = dt_util.as_utc(reference_dt)
+        return dt_util.as_utc(value_dt) > dt_util.as_utc(reference_dt)
+    except (TypeError, ValueError):
+        return False
+
+
+def is_snapshot_problem_resolved(
+    snapshot: CalendarRobotSnapshot,
+    current: RobotState,
+    now: datetime,
+    *,
+    allow_active_activity_resolution: bool,
+) -> bool:
+    """Return True only when a carried service-window problem is resolved.
+
+    Persistent timestamps are used so a successful mowing or recovery on an
+    earlier day in the same service window is not lost at daily rollover.
+    On the actual service-day morning, the existing live reconciliation rules
+    may additionally accept active normal mowing for activity/offline cases.
+    """
+    codes = set(snapshot.reason_codes)
+    has_unsolved_error = (
+        current.current_error_active is True
+        or current.binary_error == "on"
+        or current.recovery_state
+        in (RecoveryState.ACTIVE_ERROR, RecoveryState.CLEARED_BUT_UNVERIFIED)
+        or current.failed_recovery is True
+    )
+    same_day_confirmed = current.confirmed_mowing_today is True
+    confirmed_after_problem = _timestamp_is_after(
+        current.last_confirmed_mowing_at,
+        snapshot.captured_at,
+    )
+    confirmed_resolution = (
+        not has_unsolved_error
+        and (same_day_confirmed or confirmed_after_problem)
+    )
+
+    if "CHARGING_STALLED" in codes:
+        return current.charging_stalled is False and not has_unsolved_error
+
+    recovery_codes = {
+        "ACTIVE_ERROR",
+        "CLEARED_BUT_UNVERIFIED",
+        "FAILED_RECOVERY",
+        "ERROR_DURING_MOWING",
+        "ERROR_AFTER_MOWING",
+        "RECOVERY_CONFIRMATION_INVALID",
+    }
+    if codes & recovery_codes:
+        recovery_after = (
+            current.recovery_state == RecoveryState.RECOVERED
+            and current.failed_recovery is False
+            and _timestamp_is_after(
+                current.recovery_verified_at,
+                snapshot.captured_at,
+            )
+        )
+        if recovery_after or confirmed_resolution:
+            return True
+
+    activity_codes = {
+        "DID_NOT_START",
+        "ONLY_SHORT_ATTEMPT",
+        "ONLY_UNCERTAIN_ATTEMPT",
+        "NO_CONFIRMED_ACTIVITY",
+        "STARTED_BUT_NOT_CONFIRMED",
+        "MOWING_SESSION_LOST_OFFLINE",
+        "SESSION_LOST_OFFLINE",
+    }
+    if codes & activity_codes:
+        if (
+            current.online is not False
+            and confirmed_resolution
+        ):
+            return True
+
+    if "ROBOT_OFFLINE" in codes:
+        if (
+            current.online is True
+            and current.source_age_minutes is not None
+            and current.source_age_minutes <= 15
+            and confirmed_resolution
+        ):
+            return True
+
+    if allow_active_activity_resolution and "CHARGING_STALLED" not in codes:
+        return evaluate_morning_resolution(snapshot, current, now).resolved
+
+    return False
+
+
+def reconcile_service_window_snapshot(
+    existing_snapshot: EveningAttentionSnapshot | None,
+    target_calendar_date: str,
+    current_states: dict[str, RobotState],
+    current_problem_snapshots: list[CalendarRobotSnapshot],
+    now: datetime,
+    *,
+    allow_active_activity_resolution: bool = False,
+) -> tuple[list[CalendarRobotSnapshot], list[str]]:
+    """Reconcile carried problems and merge current problems for one window."""
+    retained: dict[str, CalendarRobotSnapshot] = {}
+    resolved_robot_ids: list[str] = []
+
+    if (
+        existing_snapshot is not None
+        and existing_snapshot.target_calendar_date == target_calendar_date
+    ):
+        for robot in existing_snapshot.robots:
+            current = current_states.get(robot.robot_id)
+            if current is None:
+                retained[robot.robot_id] = robot
+                continue
+            if is_snapshot_problem_resolved(
+                robot,
+                current,
+                now,
+                allow_active_activity_resolution=(
+                    allow_active_activity_resolution
+                ),
+            ):
+                resolved_robot_ids.append(robot.robot_id)
+            else:
+                retained[robot.robot_id] = robot
+
+    # Current problems always win for the same robot. This also gives a new
+    # incident a fresh captured_at while carried problems keep their original
+    # timestamp for persistent resolution comparisons.
+    for robot in current_problem_snapshots:
+        retained[robot.robot_id] = robot
+        if robot.robot_id in resolved_robot_ids:
+            resolved_robot_ids.remove(robot.robot_id)
+
+    return list(retained.values()), resolved_robot_ids
+
+
 def get_evening_problem_desc(snapshot: CalendarRobotSnapshot) -> str:
     """Return a clean Swedish explanation of the evening problem."""
     code = snapshot.reason_codes[0] if snapshot.reason_codes else ""

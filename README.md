@@ -1,6 +1,17 @@
-# Automower Supervisor v0.5.5
+# Automower Supervisor v0.5.6
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.6
+
+- **True Service-Window Worklist**: Problems accumulate across Friday-to-Monday, Monday-to-Wednesday, and Wednesday-to-Friday windows instead of being replaced by each evening's daily state.
+- **Morning Reconciliation Every Day**: The configured morning sync checks and persists the shared snapshot on all seven days. On Tuesday, Thursday, Saturday, and Sunday it does not create, update, or delete calendar events.
+- **Evening Reconciliation Every Day**: Each evening removes problems proven resolved, retains unresolved earlier problems, adds current problems, and then updates the next service-day event.
+- **Same-Day and Persistent Resolution Evidence**: `confirmed_mowing_today` resolves a problem immediately on the same day, while `last_confirmed_mowing_at` and `recovery_verified_at` preserve proof across daily rollover by comparison with the original problem timestamp.
+- **Service-Day Final Reconciliation**: Monday, Wednesday, and Friday morning runs perform the final calendar update and delete the event when no problems remain.
+- **Charging-Stall Carryover Fix**: `CHARGING_STALLED` remains in the service snapshot while active and is removed only after the charging monitor has cleared it.
+- **Window Boundary Reset**: Problems are never carried into a different target service date.
+- **Regression Tests**: Adds tests for timestamp-based resolution, current-problem replacement, service-window reset, and non-service-day morning reconciliation without calendar writes.
 
 ## Improvements in version 0.5.5
 

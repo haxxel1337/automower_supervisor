@@ -1144,16 +1144,14 @@ class AutomowerSupervisorManager:
         is_before_cutoff = (now.hour < 12) or (now.hour == 12 and now.minute == 0)
 
         last_mo_date = get_date_part(self.last_morning_sync_at)
-        from .calendar_sync import is_service_day
 
         if (
-            is_service_day(now.date())
-            and is_after_morning
+            is_after_morning
             and is_before_cutoff
             and last_mo_date != current_date_str
         ):
             _LOGGER.info(
-                "Startup catch-up: Service-day morning sync was missed "
+                "Startup catch-up: Morning snapshot reconciliation was missed "
                 "(last sync: %s). Running now...",
                 self.last_morning_sync_at,
             )
@@ -1343,6 +1341,7 @@ class AutomowerSupervisorManager:
                     get_evening_problem_desc,
                     get_next_service_date,
                     get_stockholm_timezone,
+                    reconcile_service_window_snapshot,
                 )
 
                 tz = get_stockholm_timezone()
@@ -1398,6 +1397,17 @@ class AutomowerSupervisorManager:
                             ),
                         )
                     )
+
+                attention_robots, _resolved_ids = (
+                    reconcile_service_window_snapshot(
+                        self.calendar_snapshot,
+                        target_date_str,
+                        self.robots,
+                        attention_robots,
+                        local_now,
+                        allow_active_activity_resolution=False,
+                    )
+                )
 
                 snapshot = EveningAttentionSnapshot(
                     source_date=source_date_str,
@@ -1509,67 +1519,162 @@ class AutomowerSupervisorManager:
                 return "error"
 
     async def async_run_morning_calendar_sync(self, now: datetime) -> str:
-        """Reconcile the worklist at 11:20 on Monday, Wednesday, or Friday."""
+        """Reconcile the service-window snapshot every morning at configured time."""
         if not self.calendar_enabled:
             return "disabled"
-
-        entity_id = self.calendar_entity_id
-        validation_result = await self._async_validate_calendar_entity(entity_id)
-        if validation_result is not None:
-            return validation_result
 
         async with self._calendar_sync_lock:
             try:
                 from .calendar_sync import (
+                    CalendarRobotSnapshot,
+                    EveningAttentionSnapshot,
                     async_fetch_managed_event,
                     build_calendar_description,
                     evaluate_morning_resolution,
                     get_evening_problem_desc,
+                    get_next_service_date,
                     get_stockholm_timezone,
                     is_service_day,
+                    reconcile_service_window_snapshot,
                 )
 
                 tz = get_stockholm_timezone()
                 local_now = now.astimezone(tz)
                 current_date_str = local_now.date().isoformat()
+                service_day = is_service_day(local_now.date())
+                target_date = get_next_service_date(
+                    local_now,
+                    include_current=True,
+                )
+                target_date_str = target_date.isoformat()
 
-                if not is_service_day(local_now.date()):
-                    self.last_morning_sync_at = local_now.isoformat()
-                    self.last_calendar_sync_result = "not_service_day"
+                def current_critical_snapshot(
+                    robot_id: str,
+                    state: RobotState,
+                ) -> CalendarRobotSnapshot | None:
+                    reason = None
+                    text = state.daily_attention_text or ""
+
+                    if (
+                        state.current_error_active is True
+                        or state.binary_error == "on"
+                        or state.recovery_state == RecoveryState.ACTIVE_ERROR
+                    ):
+                        reason = "ACTIVE_ERROR"
+                        text = text or (
+                            f'{state.display_name}: Aktivt fel '
+                            f'"{state.last_real_error or "Okänt fel"}."'
+                        )
+                    elif (
+                        state.recovery_state
+                        == RecoveryState.CLEARED_BUT_UNVERIFIED
+                    ):
+                        reason = "CLEARED_BUT_UNVERIFIED"
+                        text = text or (
+                            f'{state.display_name}: Tidigare fel '
+                            f'"{state.last_real_error or "Okänt fel"}" är '
+                            "nollställt men inte verifierat återställt."
+                        )
+                    elif state.failed_recovery is True:
+                        reason = "FAILED_RECOVERY"
+                        text = text or (
+                            f"{state.display_name}: Misslyckad återhämtning efter fel."
+                        )
+                    elif state.online is False:
+                        reason = "ROBOT_OFFLINE"
+                        text = text or f"{state.display_name}: Roboten är offline."
+                    elif state.charging_stalled is True:
+                        reason = "CHARGING_STALLED"
+                        text = text or (
+                            f"{state.display_name}: Roboten står som Charging "
+                            "men batteriet minskar."
+                        )
+
+                    if reason is None:
+                        return None
+
+                    return CalendarRobotSnapshot(
+                        robot_id=robot_id,
+                        display_name=state.display_name,
+                        severity="critical",
+                        reason_codes=[reason],
+                        text=text,
+                        captured_at=local_now.isoformat(),
+                        current_status_plain=state.current_status_plain,
+                        current_battery=state.current_battery,
+                        online=state.online,
+                        last_real_error=state.last_real_error,
+                        recovery_state=str(state.recovery_state.value),
+                        last_mowing_attempt_result=(
+                            state.last_mowing_attempt_result
+                        ),
+                    )
+
+                current_critical = []
+                for robot_id, state in self.robots.items():
+                    snapshot_robot = current_critical_snapshot(robot_id, state)
+                    if snapshot_robot is not None:
+                        current_critical.append(snapshot_robot)
+
+                reconciled_robots, resolved_ids = (
+                    reconcile_service_window_snapshot(
+                        self.calendar_snapshot,
+                        target_date_str,
+                        self.robots,
+                        current_critical,
+                        local_now,
+                        allow_active_activity_resolution=service_day,
+                    )
+                )
+
+                self.calendar_snapshot = EveningAttentionSnapshot(
+                    source_date=current_date_str,
+                    target_calendar_date=target_date_str,
+                    captured_at=local_now.isoformat(),
+                    robots=reconciled_robots,
+                )
+                self.morning_reconciled_at = local_now.isoformat()
+                self.morning_remaining_robot_ids = [
+                    robot.robot_id for robot in reconciled_robots
+                ]
+                self.morning_resolved_robot_ids = list(
+                    dict.fromkeys(resolved_ids)
+                )
+                self.last_morning_sync_at = local_now.isoformat()
+
+                if not service_day:
+                    self.last_calendar_sync_result = (
+                        "snapshot_reconciled_non_service_day"
+                    )
                     self.last_calendar_sync_error = None
                     self.last_calendar_sync_at = local_now.isoformat()
                     await self._storage.async_save(self.get_storage_data())
                     self._notify_callbacks()
-                    return "not_service_day"
+                    return "snapshot_reconciled_non_service_day"
 
-                snapshot = self.calendar_snapshot
-                snapshot_robots_by_id = {}
-                if (
-                    snapshot
-                    and snapshot.target_calendar_date == current_date_str
-                ):
-                    snapshot_robots_by_id = {
-                        robot.robot_id: robot for robot in snapshot.robots
-                    }
+                entity_id = self.calendar_entity_id
+                validation_result = await self._async_validate_calendar_entity(
+                    entity_id
+                )
+                if validation_result is not None:
+                    return validation_result
 
                 remaining_robots_data = []
-                morning_remaining_robot_ids = []
-                morning_resolved_robot_ids = []
+                remaining_snapshot_robots = []
+                final_resolved_ids = list(resolved_ids)
 
-                for robot_id, snapshot_robot in (
-                    snapshot_robots_by_id.items()
-                ):
-                    current_state = self.robots[robot_id]
+                for snapshot_robot in reconciled_robots:
+                    current_state = self.robots[snapshot_robot.robot_id]
                     resolution = evaluate_morning_resolution(
                         snapshot_robot,
                         current_state,
                         local_now,
                     )
                     if resolution.keep:
-                        morning_remaining_robot_ids.append(robot_id)
+                        remaining_snapshot_robots.append(snapshot_robot)
                         remaining_robots_data.append(
                             {
-                                "robot_id": robot_id,
+                                "robot_id": snapshot_robot.robot_id,
                                 "display_name": current_state.display_name,
                                 "evening_text": get_evening_problem_desc(
                                     snapshot_robot
@@ -1590,81 +1695,7 @@ class AutomowerSupervisorManager:
                             }
                         )
                     else:
-                        morning_resolved_robot_ids.append(robot_id)
-
-                # Include critical problems discovered after evening sync.
-                for robot_id, current_state in self.robots.items():
-                    if robot_id in snapshot_robots_by_id:
-                        continue
-
-                    is_critical_now = (
-                        current_state.current_error_active is True
-                        or current_state.binary_error == "on"
-                        or current_state.recovery_state
-                        in (
-                            RecoveryState.ACTIVE_ERROR,
-                            RecoveryState.CLEARED_BUT_UNVERIFIED,
-                        )
-                        or current_state.failed_recovery is True
-                        or current_state.online is False
-                        or current_state.charging_stalled is True
-                    )
-                    if not is_critical_now:
-                        continue
-
-                    morning_remaining_robot_ids.append(robot_id)
-                    if current_state.charging_stalled:
-                        morning_status_text = (
-                            "Roboten står som Charging men batteriet minskar."
-                        )
-                    elif current_state.online is False:
-                        morning_status_text = "Roboten är offline."
-                    elif (
-                        current_state.current_error_active is True
-                        or current_state.binary_error == "on"
-                        or current_state.recovery_state
-                        == RecoveryState.ACTIVE_ERROR
-                    ):
-                        morning_status_text = (
-                            f"Aktivt fel "
-                            f"\"{current_state.last_real_error or 'Okänt fel'}\"."
-                        )
-                    elif (
-                        current_state.recovery_state
-                        == RecoveryState.CLEARED_BUT_UNVERIFIED
-                    ):
-                        morning_status_text = (
-                            f"Tidigare fel "
-                            f"\"{current_state.last_real_error or 'Okänt fel'}\" "
-                            "är nollställt men inte verifierat återställt."
-                        )
-                    else:
-                        morning_status_text = (
-                            "Misslyckad återhämtning efter fel."
-                        )
-
-                    remaining_robots_data.append(
-                        {
-                            "robot_id": robot_id,
-                            "display_name": current_state.display_name,
-                            "evening_text": (
-                                "Problem upptäckt efter senaste kvällssynken."
-                            ),
-                            "current_status": (
-                                current_state.current_status_plain
-                                or current_state.current_status
-                                or "saknas"
-                            ),
-                            "battery": current_state.current_battery,
-                            "recovery_state": (
-                                str(current_state.recovery_state.value)
-                                if current_state.recovery_state
-                                != RecoveryState.NONE
-                                else "none"
-                            ),
-                            "morning_status_text": morning_status_text,
-                        }
-                    )
+                        final_resolved_ids.append(snapshot_robot.robot_id)
 
                 from .const import ROBOTS
 
@@ -1677,13 +1708,27 @@ class AutomowerSupervisorManager:
                     for robot_id in ROBOTS
                     if robot_id in remaining_by_id
                 ]
+                remaining_snapshot_by_id = {
+                    robot.robot_id: robot
+                    for robot in remaining_snapshot_robots
+                }
+                sorted_remaining_snapshots = [
+                    remaining_snapshot_by_id[robot_id]
+                    for robot_id in ROBOTS
+                    if robot_id in remaining_snapshot_by_id
+                ]
 
-                self.morning_reconciled_at = local_now.isoformat()
-                self.morning_remaining_robot_ids = list(
-                    dict.fromkeys(morning_remaining_robot_ids)
+                self.calendar_snapshot = EveningAttentionSnapshot(
+                    source_date=current_date_str,
+                    target_calendar_date=target_date_str,
+                    captured_at=local_now.isoformat(),
+                    robots=sorted_remaining_snapshots,
                 )
+                self.morning_remaining_robot_ids = [
+                    robot.robot_id for robot in sorted_remaining_snapshots
+                ]
                 self.morning_resolved_robot_ids = list(
-                    dict.fromkeys(morning_resolved_robot_ids)
+                    dict.fromkeys(final_resolved_ids)
                 )
 
                 existing_event = await async_fetch_managed_event(
@@ -1747,7 +1792,6 @@ class AutomowerSupervisorManager:
                     )
                     self.event_cache = {}
 
-                self.last_morning_sync_at = local_now.isoformat()
                 self.last_calendar_sync_result = result_code
                 self.last_calendar_sync_error = None
                 self.last_calendar_sync_at = local_now.isoformat()

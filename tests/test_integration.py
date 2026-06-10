@@ -3746,6 +3746,34 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 11 - ONLY_SHORT_ATTEMPT + Sleeping -> Kept
     # ----------------------------------------------------
+    # Scenario 10 correctly removed the resolved Tuv4 problem from the
+    # persistent service-window snapshot. Re-add a fresh Tuv4 problem so this
+    # scenario is independent and actually tests an unresolved sleeping robot.
+    from custom_components.automower_supervisor.calendar_sync import (
+        CalendarRobotSnapshot,
+    )
+
+    # Re-add a fresh Tuv4 problem so this scenario is independent.
+    manager.calendar_snapshot.robots.append(
+        CalendarRobotSnapshot(
+            robot_id="automowertuv4",
+            display_name="Tuv4",
+            severity="warning",
+            reason_codes=["ONLY_SHORT_ATTEMPT"],
+            text=(
+                "Tuv4: Roboten gjorde endast ett kort klippförsök "
+                "på 44 sekunder."
+            ),
+            captured_at=t_base.isoformat(),
+            current_status_plain="Sleeping",
+            current_battery=100,
+            online=True,
+            last_real_error=None,
+            recovery_state="none",
+            last_mowing_attempt_result="short_attempt",
+        )
+    )
+
     manager.robots["automowertuv4"].current_status_plain = "Sleeping"
     manager.robots["automowertuv4"].mowing_session_active = False
     manager.robots["automowertuv4"].confirmed_mowing_today = False
@@ -3760,8 +3788,12 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 12 - ONLY_UNCERTAIN_ATTEMPT + Mowing -> Removed
     # ----------------------------------------------------
-    # Let's adjust snapshot to say ONLY_UNCERTAIN_ATTEMPT for TUV4
-    manager.calendar_snapshot.robots[1].reason_codes = ["ONLY_UNCERTAIN_ATTEMPT"]
+    # Adjust Tuv4's snapshot without relying on list position.
+    next(
+        robot
+        for robot in manager.calendar_snapshot.robots
+        if robot.robot_id == "automowertuv4"
+    ).reason_codes = ["ONLY_UNCERTAIN_ATTEMPT"]
     manager.robots["automowertuv4"].current_status_plain = "Mowing"
     manager.robots["automowertuv4"].mowing_session_active = True
     
@@ -3772,7 +3804,23 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 13 - DID_NOT_START + Mowing -> Removed
     # ----------------------------------------------------
-    manager.calendar_snapshot.robots[1].reason_codes = ["DID_NOT_START"]
+    # v0.5.6: recreate removed snapshot entries for independent scenarios.
+    manager.calendar_snapshot.robots.append(
+        CalendarRobotSnapshot(
+            robot_id="automowertuv4",
+            display_name="Tuv4",
+            severity="warning",
+            reason_codes=["DID_NOT_START"],
+            text="Tuv4: Ingen klippsession har registrerats.",
+            captured_at=t_base.isoformat(),
+            current_status_plain="Mowing",
+            current_battery=100,
+            online=True,
+            last_real_error=None,
+            recovery_state="none",
+            last_mowing_attempt_result=None,
+        )
+    )
     manager.robots["automowertuv4"].current_status_plain = "Mowing"
     manager.robots["automowertuv4"].mowing_session_active = True
     
@@ -3783,6 +3831,22 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 14 - DID_NOT_START + Parked -> Kept
     # ----------------------------------------------------
+    manager.calendar_snapshot.robots.append(
+        CalendarRobotSnapshot(
+            robot_id="automowertuv4",
+            display_name="Tuv4",
+            severity="warning",
+            reason_codes=["DID_NOT_START"],
+            text="Tuv4: Ingen klippsession har registrerats.",
+            captured_at=t_base.isoformat(),
+            current_status_plain="Parked",
+            current_battery=100,
+            online=True,
+            last_real_error=None,
+            recovery_state="none",
+            last_mowing_attempt_result=None,
+        )
+    )
     manager.robots["automowertuv4"].current_status_plain = "Parked"
     manager.robots["automowertuv4"].mowing_session_active = False
     manager.robots["automowertuv4"].confirmed_mowing_today = False
@@ -3799,8 +3863,12 @@ async def test_version_0_5_2_scenarios() -> None:
     # Mark Tuv4 as resolved now so it is removed from remaining robots list
     manager.robots["automowertuv4"].confirmed_mowing_today = True
 
-    # Set KV5 to CLEARED_BUT_UNVERIFIED
-    manager.calendar_snapshot.robots[0].reason_codes = ["CLEARED_BUT_UNVERIFIED"]
+    # Set KV5 to CLEARED_BUT_UNVERIFIED without relying on list position.
+    next(
+        robot
+        for robot in manager.calendar_snapshot.robots
+        if robot.robot_id == "automowerkv5"
+    ).reason_codes = ["CLEARED_BUT_UNVERIFIED"]
     manager.robots["automowerkv5"].current_error_active = False
     manager.robots["automowerkv5"].binary_error = "off"
     manager.robots["automowerkv5"].failed_recovery = False
@@ -3827,7 +3895,22 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 17 - ACTIVE_ERROR + Mowing (active error) -> Kept
     # ----------------------------------------------------
-    manager.calendar_snapshot.robots[0].reason_codes = ["ACTIVE_ERROR"]
+    manager.calendar_snapshot.robots.append(
+        CalendarRobotSnapshot(
+            robot_id="automowerkv5",
+            display_name="Kv5",
+            severity="critical",
+            reason_codes=["ACTIVE_ERROR"],
+            text='Kv5: Aktivt fel "Blade disc blocked".',
+            captured_at=t_base.isoformat(),
+            current_status_plain="Mowing",
+            current_battery=100,
+            online=True,
+            last_real_error="Blade disc blocked",
+            recovery_state="active_error",
+            last_mowing_attempt_result=None,
+        )
+    )
     manager.robots["automowerkv5"].current_error_active = True
     manager.robots["automowerkv5"].recovery_state = RecoveryState.ACTIVE_ERROR
     manager.robots["automowerkv5"].current_status_plain = "Mowing" # Mowing but error active!
@@ -3841,7 +3924,32 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 18 - Offline + offline -> Kept
     # ----------------------------------------------------
-    manager.calendar_snapshot.robots[2].reason_codes = ["ROBOT_OFFLINE"]
+    vv14_mini_snapshot = next(
+        (
+            robot
+            for robot in manager.calendar_snapshot.robots
+            if robot.robot_id == "automowervv14mini"
+        ),
+        None,
+    )
+    if vv14_mini_snapshot is None:
+        vv14_mini_snapshot = CalendarRobotSnapshot(
+            robot_id="automowervv14mini",
+            display_name="Vv14 Mini",
+            severity="critical",
+            reason_codes=["ROBOT_OFFLINE"],
+            text="Vv14 Mini: Roboten är offline.",
+            captured_at=t_base.isoformat(),
+            current_status_plain="Sleeping",
+            current_battery=100,
+            online=False,
+            last_real_error=None,
+            recovery_state="none",
+            last_mowing_attempt_result=None,
+        )
+        manager.calendar_snapshot.robots.append(vv14_mini_snapshot)
+    else:
+        vv14_mini_snapshot.reason_codes = ["ROBOT_OFFLINE"]
     manager.robots["automowervv14mini"].online = False
     
     await manager.async_run_morning_calendar_sync(t_morning)
@@ -3874,16 +3982,31 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 21 - New active error during night -> Added
     # ----------------------------------------------------
-    # Flag VV14 Big (not in snapshot) with active error
-    manager.robots["automowervv14big"].current_error_active = True
-    manager.robots["automowervv14big"].last_real_error = "Collision error"
-    manager.robots["automowervv14big"].online = True
-    
-    await manager.async_run_morning_calendar_sync(t_morning)
+    # v0.5.6: explicit new overnight critical incident.
+    vv14_big = manager.robots["automowervv14big"]
+    vv14_big.confirmed_mowing_today = False
+    vv14_big.current_error_active = True
+    # current_error_active/recovery_state are sufficient for this incident;
+    # keep the independent binary sensor clear so later resolution scenarios
+    # do not inherit an unrelated active binary error.
+    vv14_big.binary_error = "off"
+    vv14_big.recovery_state = RecoveryState.ACTIVE_ERROR
+    vv14_big.last_real_error = "Collision error"
+    vv14_big.online = True
+    vv14_big.daily_attention_required = True
+    vv14_big.daily_attention_reason_codes = ["ACTIVE_ERROR"]
+    vv14_big.daily_attention_text = (
+        'Vv14 Big: Aktivt fel "Collision error".'
+    )
+
+    result = await manager.async_run_morning_calendar_sync(t_morning)
+    assert result == "updated"
+    assert "automowervv14big" in manager.morning_remaining_robot_ids
+
     event = mock_cal_entity.events[-1]
     assert "Vv14 Big" in event.summary
     assert "Collision error" in event.description
-    
+
     # ----------------------------------------------------
     # Scenario 22 - Normal DID_NOT_START not added at 11:20
     # ----------------------------------------------------
@@ -3912,27 +4035,52 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 25 - Morning sync deletes event if remaining empty
     # ----------------------------------------------------
-    manager.robots["automowerkv5"].current_error_active = False
-    manager.robots["automowerkv5"].recovery_state = RecoveryState.RECOVERED
-    manager.robots["automowervv14big"].current_error_active = False
-    manager.robots["automowervv14big"].recovery_state = RecoveryState.NONE
-    
+    # v0.5.6: normalize every robot before asserting an empty worklist.
+    # Earlier scenarios intentionally exercise active errors, offline states,
+    # recovery states, and activity problems. This scenario must not inherit
+    # any of those states when it verifies deletion of an empty worklist.
+    for state in manager.robots.values():
+        state.current_error_active = False
+        state.binary_error = "off"
+        state.failed_recovery = False
+        state.charging_stalled = False
+        state.online = True
+        state.source_age_minutes = 0
+        state.recovery_state = RecoveryState.RECOVERED
+        state.confirmed_mowing_today = True
+        state.mowing_session_active = False
+        state.pending_mowing_confirmation = False
+
     res = await manager.async_run_morning_calendar_sync(t_morning)
     assert res == "deleted"
     assert len(mock_cal_entity.events) == 0
-    
+
     # ----------------------------------------------------
     # Scenario 26 - Morning sync idempotence
     # ----------------------------------------------------
-    manager.robots["automowerkv5"].current_error_active = True # Restore one
+    # v0.5.6: create a complete fresh active-error incident for Kv5.
+    kv5 = manager.robots["automowerkv5"]
+    kv5.confirmed_mowing_today = False
+    kv5.current_error_active = True
+    kv5.binary_error = "off"
+    kv5.failed_recovery = False
+    kv5.recovery_state = RecoveryState.ACTIVE_ERROR
+    kv5.last_real_error = "Blade disc blocked"
+    kv5.online = True
+    kv5.source_age_minutes = 0
+    kv5.daily_attention_required = True
+    kv5.daily_attention_reason_codes = ["ACTIVE_ERROR"]
+    kv5.daily_attention_text = 'Kv5: Aktivt fel "Blade disc blocked".'
+
     res = await manager.async_run_morning_calendar_sync(t_morning)
     assert res == "created"
     assert len(mock_cal_entity.events) == 1
-    
+    assert "automowerkv5" in manager.morning_remaining_robot_ids
+
     res = await manager.async_run_morning_calendar_sync(t_morning)
     assert res == "updated"
     assert len(mock_cal_entity.events) == 1
-    
+
     # ----------------------------------------------------
     # Scenario 27 - Deduplicate same robot in snapshot/morning
     # ----------------------------------------------------
@@ -4473,3 +4621,170 @@ async def test_service_day_calendar_mapping() -> None:
     assert is_service_day(datetime.date(2026, 6, 17)) is True
     assert is_service_day(datetime.date(2026, 6, 20)) is False
 
+
+
+
+def test_service_window_reconciliation_uses_persistent_timestamps() -> None:
+    """Carried activity problems resolve after later confirmed mowing."""
+    import zoneinfo
+
+    from custom_components.automower_supervisor.calendar_sync import (
+        CalendarRobotSnapshot,
+        EveningAttentionSnapshot,
+        reconcile_service_window_snapshot,
+    )
+    from custom_components.automower_supervisor.models import RobotState
+
+    tz = zoneinfo.ZoneInfo("Europe/Stockholm")
+    captured = "2026-06-12T20:00:00+02:00"
+    old_problem = CalendarRobotSnapshot(
+        robot_id="automowerkv5",
+        display_name="Kv5",
+        severity="warning",
+        reason_codes=["ONLY_SHORT_ATTEMPT"],
+        text="Kv5: Endast ett kort klippförsök.",
+        captured_at=captured,
+        current_status_plain="Parked",
+        current_battery=80,
+        online=True,
+        last_real_error=None,
+        recovery_state="none",
+        last_mowing_attempt_result="short_attempt",
+    )
+    old_snapshot = EveningAttentionSnapshot(
+        source_date="2026-06-12",
+        target_calendar_date="2026-06-15",
+        captured_at=captured,
+        robots=[old_problem],
+    )
+    state = RobotState(robot_id="automowerkv5", display_name="Kv5")
+    state.online = True
+    state.current_status_plain = "Parked"
+    state.last_confirmed_mowing_at = "2026-06-13T14:00:00+02:00"
+
+    robots, resolved = reconcile_service_window_snapshot(
+        old_snapshot,
+        "2026-06-15",
+        {"automowerkv5": state},
+        [],
+        datetime.datetime(2026, 6, 14, 11, 20, tzinfo=tz),
+    )
+    assert robots == []
+    assert resolved == ["automowerkv5"]
+
+    # Same-day confirmed mowing is also valid before daily rollover.
+    state.last_confirmed_mowing_at = None
+    state.confirmed_mowing_today = True
+    robots, resolved = reconcile_service_window_snapshot(
+        old_snapshot,
+        "2026-06-15",
+        {"automowerkv5": state},
+        [],
+        datetime.datetime(2026, 6, 12, 21, 0, tzinfo=tz),
+    )
+    assert robots == []
+    assert resolved == ["automowerkv5"]
+
+    state.confirmed_mowing_today = False
+    state.last_confirmed_mowing_at = "2026-06-13T14:00:00+02:00"
+
+    # A new current problem for the same robot wins and receives a new entry.
+    new_problem = CalendarRobotSnapshot(
+        robot_id="automowerkv5",
+        display_name="Kv5",
+        severity="critical",
+        reason_codes=["ACTIVE_ERROR"],
+        text='Kv5: Aktivt fel "Blade disc blocked".',
+        captured_at="2026-06-14T20:00:00+02:00",
+        current_status_plain="Error",
+        current_battery=70,
+        online=True,
+        last_real_error="Blade disc blocked",
+        recovery_state="active_error",
+        last_mowing_attempt_result=None,
+    )
+    robots, resolved = reconcile_service_window_snapshot(
+        old_snapshot,
+        "2026-06-15",
+        {"automowerkv5": state},
+        [new_problem],
+        datetime.datetime(2026, 6, 14, 20, 0, tzinfo=tz),
+    )
+    assert len(robots) == 1
+    assert robots[0].reason_codes == ["ACTIVE_ERROR"]
+    assert resolved == []
+
+    # Nothing from Monday is carried into the Wednesday service window.
+    robots, resolved = reconcile_service_window_snapshot(
+        old_snapshot,
+        "2026-06-17",
+        {"automowerkv5": state},
+        [],
+        datetime.datetime(2026, 6, 15, 20, 0, tzinfo=tz),
+    )
+    assert robots == []
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_non_service_morning_reconciles_snapshot_without_calendar_write() -> None:
+    """Tuesday morning updates storage but never writes the calendar."""
+    import zoneinfo
+
+    from custom_components.automower_supervisor.calendar_sync import (
+        CalendarRobotSnapshot,
+        EveningAttentionSnapshot,
+    )
+
+    hass = MagicMock()
+    entry = MockConfigEntry()
+    entry.options = {
+        "calendar_enabled": True,
+        "calendar_entity_id": "calendar.automower",
+        "morning_sync_time": "11:20",
+    }
+    hass.config_entries.async_entries.return_value = [entry]
+    hass.services.async_call = AsyncMock()
+
+    manager = AutomowerSupervisorManager(hass)
+    manager._storage.async_save = AsyncMock()
+
+    captured = "2026-06-15T20:00:00+02:00"
+    manager.calendar_snapshot = EveningAttentionSnapshot(
+        source_date="2026-06-15",
+        target_calendar_date="2026-06-17",
+        captured_at=captured,
+        robots=[
+            CalendarRobotSnapshot(
+                robot_id="automowerkv5",
+                display_name="Kv5",
+                severity="warning",
+                reason_codes=["ONLY_SHORT_ATTEMPT"],
+                text="Kv5: Endast ett kort klippförsök.",
+                captured_at=captured,
+                current_status_plain="Parked",
+                current_battery=80,
+                online=True,
+                last_real_error=None,
+                recovery_state="none",
+                last_mowing_attempt_result="short_attempt",
+            )
+        ],
+    )
+    state = manager.robots["automowerkv5"]
+    state.online = True
+    state.current_status_plain = "Parked"
+    state.last_confirmed_mowing_at = "2026-06-16T08:00:00+02:00"
+
+    tz = zoneinfo.ZoneInfo("Europe/Stockholm")
+    result = await manager.async_run_morning_calendar_sync(
+        datetime.datetime(2026, 6, 16, 11, 20, tzinfo=tz)
+    )
+
+    assert result == "snapshot_reconciled_non_service_day"
+    assert manager.calendar_snapshot.target_calendar_date == "2026-06-17"
+    assert manager.calendar_snapshot.robots == []
+    assert manager.morning_resolved_robot_ids == ["automowerkv5"]
+    assert manager.event_cache == {}
+    hass.services.async_call.assert_not_awaited()
+    manager._storage.async_save.assert_awaited()
