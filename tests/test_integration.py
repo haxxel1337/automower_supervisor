@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+from enum import IntFlag
 from types import ModuleType
 from typing import Any, Callable
 from unittest.mock import MagicMock, AsyncMock
@@ -53,6 +54,8 @@ for mod_name in [
     "homeassistant.helpers.entity_platform",
     "homeassistant.helpers.selector",
     "homeassistant.components",
+    "homeassistant.components.calendar",
+    "homeassistant.components.calendar.const",
     "homeassistant.components.sensor",
     "homeassistant.util",
     "homeassistant.util.dt",
@@ -75,11 +78,23 @@ homeassistant.helpers.device_registry = sys.modules["homeassistant.helpers.devic
 homeassistant.helpers.entity_platform = sys.modules["homeassistant.helpers.entity_platform"]
 homeassistant.helpers.selector = sys.modules["homeassistant.helpers.selector"]
 homeassistant.components = sys.modules["homeassistant.components"]
+homeassistant.components.__path__ = []
+homeassistant.components.calendar = sys.modules["homeassistant.components.calendar"]
+homeassistant.components.calendar.const = sys.modules["homeassistant.components.calendar.const"]
 homeassistant.components.sensor = sys.modules["homeassistant.components.sensor"]
 homeassistant.util = sys.modules["homeassistant.util"]
 homeassistant.util.dt = sys.modules["homeassistant.util.dt"]
 homeassistant.data_entry_flow = sys.modules["homeassistant.data_entry_flow"]
 homeassistant.data_entry_flow.FlowResult = dict
+
+class MockCalendarEntityFeature(IntFlag):
+    CREATE_EVENT = 1
+    DELETE_EVENT = 2
+    UPDATE_EVENT = 4
+
+homeassistant.components.calendar.const.CalendarEntityFeature = (
+    MockCalendarEntityFeature
+)
 
 # Setup homeassistant.const
 import homeassistant.const
@@ -3352,8 +3367,8 @@ async def test_version_0_4_4_scenarios() -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_0_5_0_scenarios() -> None:
-    """Comprehensive scenario tests for version 0.5.0 calendar integration."""
+async def test_version_0_5_2_scenarios() -> None:
+    """Comprehensive scenario tests for version 0.5.2 calendar integration."""
     import datetime
     import zoneinfo
     import voluptuous as vol
@@ -3380,14 +3395,56 @@ async def test_version_0_5_0_scenarios() -> None:
         def __init__(self):
             self.events = []
             self.deleted_uids = []
-            
+            self.updated_uids = []
+            self.supported_features = (
+                MockCalendarEntityFeature.CREATE_EVENT
+                | MockCalendarEntityFeature.DELETE_EVENT
+                | MockCalendarEntityFeature.UPDATE_EVENT
+            )
+
         async def async_get_events(self, hass, start_dt, end_dt):
             # Return events overlapping start_dt and end_dt
-            return [e for e in self.events if not (e.end <= start_dt or e.start >= end_dt)]
-            
-        async def async_delete_event(self, uid, recurrence_id=None, recurrence_range=None):
+            return [
+                event
+                for event in self.events
+                if not (event.end <= start_dt or event.start >= end_dt)
+            ]
+
+        async def async_delete_event(
+            self,
+            uid,
+            recurrence_id=None,
+            recurrence_range=None,
+        ):
             self.deleted_uids.append(uid)
-            self.events = [e for e in self.events if e.uid != uid]
+            self.events = [
+                event
+                for event in self.events
+                if event.uid != uid
+            ]
+
+        async def async_update_event(self, uid, event):
+            self.updated_uids.append(uid)
+
+            existing = next(
+                (
+                    current
+                    for current in self.events
+                    if current.uid == uid
+                ),
+                None,
+            )
+            if existing is None:
+                raise ValueError(f"Calendar event not found: {uid}")
+
+            if "summary" in event:
+                existing.summary = event["summary"]
+            if "description" in event:
+                existing.description = event["description"]
+            if "start" in event:
+                existing.start = event["start"]
+            if "end" in event:
+                existing.end = event["end"]
             
     mock_cal_entity = MockCalendarEntity()
     mock_component = MagicMock()
@@ -3402,11 +3459,31 @@ async def test_version_0_5_0_scenarios() -> None:
         if domain == "calendar" and service == "create_event":
             created_events.append(service_data)
             
-            # Reconstruct Datetimes from format to place in entity mock
-            from custom_components.automower_supervisor.calendar_sync import get_stockholm_timezone
+            # Accept timezone-aware datetime objects used by v0.5.2,
+            # while remaining compatible with the older string format.
+            from custom_components.automower_supervisor.calendar_sync import (
+                get_stockholm_timezone,
+            )
+
             tz = get_stockholm_timezone()
-            dt_start = datetime.datetime.strptime(service_data["start_date_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
-            dt_end = datetime.datetime.strptime(service_data["end_date_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
+            start_value = service_data["start_date_time"]
+            end_value = service_data["end_date_time"]
+
+            if isinstance(start_value, datetime.datetime):
+                dt_start = start_value
+            else:
+                dt_start = datetime.datetime.strptime(
+                    start_value,
+                    "%Y-%m-%d %H:%M:%S",
+                ).replace(tzinfo=tz)
+
+            if isinstance(end_value, datetime.datetime):
+                dt_end = end_value
+            else:
+                dt_end = datetime.datetime.strptime(
+                    end_value,
+                    "%Y-%m-%d %H:%M:%S",
+                ).replace(tzinfo=tz)
             
             uid = f"mock-uid-{len(created_events)}"
             mock_cal_entity.events.append(
@@ -3508,8 +3585,12 @@ async def test_version_0_5_0_scenarios() -> None:
     # Scenario 2 - Event start/end timing (12:00 - 12:30 next day)
     # ----------------------------------------------------
     event = created_events[-1]
-    assert event["start_date_time"] == "2026-06-10 12:00:00"
-    assert event["end_date_time"] == "2026-06-10 12:30:00"
+    assert event["start_date_time"] == datetime.datetime(
+        2026, 6, 10, 12, 0, 0, tzinfo=tz
+    )
+    assert event["end_date_time"] == datetime.datetime(
+        2026, 6, 10, 12, 30, 0, tzinfo=tz
+    )
     
     # ----------------------------------------------------
     # Scenario 3 - Event Title uses ROBOTS sorting order
@@ -3590,7 +3671,7 @@ async def test_version_0_5_0_scenarios() -> None:
     assert len(mock_cal_entity.events) == 1
     
     res = await manager.async_run_evening_calendar_sync(t_base)
-    assert res == "replaced"
+    assert res == "updated"
     assert len(mock_cal_entity.events) == 1 # Still 1 event
     
     # ----------------------------------------------------
@@ -3603,7 +3684,7 @@ async def test_version_0_5_0_scenarios() -> None:
     manager_reload.robots["automowerkv5"].daily_attention_required = True
     
     res = await manager_reload.async_run_evening_calendar_sync(t_base)
-    assert res == "replaced"
+    assert res == "updated"
     assert len(mock_cal_entity.events) == 1
     
     # ----------------------------------------------------
@@ -3652,7 +3733,7 @@ async def test_version_0_5_0_scenarios() -> None:
     manager.robots["automowerkv5"].current_error_active = True
     
     res = await manager.async_run_morning_calendar_sync(t_morning)
-    assert res == "replaced"
+    assert res == "updated"
     
     # Verify Tuv4 is removed from title
     event = mock_cal_entity.events[-1]
@@ -3846,7 +3927,7 @@ async def test_version_0_5_0_scenarios() -> None:
     assert len(mock_cal_entity.events) == 1
     
     res = await manager.async_run_morning_calendar_sync(t_morning)
-    assert res == "replaced"
+    assert res == "updated"
     assert len(mock_cal_entity.events) == 1
     
     # ----------------------------------------------------
@@ -3888,7 +3969,7 @@ async def test_version_0_5_0_scenarios() -> None:
         )
     )
     res = await manager.async_run_morning_calendar_sync(t_morning)
-    assert res == "replaced"
+    assert res == "updated"
     assert "dup-uid" in mock_cal_entity.deleted_uids
     assert len(mock_cal_entity.events) == 1
     
@@ -3953,40 +4034,98 @@ async def test_version_0_5_0_scenarios() -> None:
     states_db["calendar.automower"] = MockState("off")
     
     # ----------------------------------------------------
-    # Scenario 35 - Delete API error caught and cached for retry
+    # Scenario 35 - Update API error preserves existing event
     # ----------------------------------------------------
-    async def mock_delete_raise(uid, recurrence_id=None, recurrence_range=None):
-        raise ValueError("Calendar connection timed out")
-        
-    mock_cal_entity.async_delete_event = mock_delete_raise
+    original_update_event = mock_cal_entity.async_update_event
+    existing_uids_before = [event.uid for event in mock_cal_entity.events]
+
+    async def mock_update_raise(uid, event):
+        raise ValueError("Calendar update timed out")
+
+    mock_cal_entity.async_update_event = mock_update_raise
     res = await manager.async_run_morning_calendar_sync(t_morning)
+
     assert res == "error"
     assert manager.last_calendar_sync_result == "error"
-    assert "connection timed out" in manager.last_calendar_sync_error
-    
-    # Restore
-    async def mock_delete_restore(uid, recurrence_id=None, recurrence_range=None):
-        mock_cal_entity.deleted_uids.append(uid)
-        mock_cal_entity.events = [e for e in mock_cal_entity.events if e.uid != uid]
-    mock_cal_entity.async_delete_event = mock_delete_restore
-    
+    assert "Calendar update timed out" in manager.last_calendar_sync_error
+    assert [event.uid for event in mock_cal_entity.events] == existing_uids_before
+
+    mock_cal_entity.async_update_event = original_update_event
+
     # ----------------------------------------------------
-    # Scenario 36 - Create API error caught and cached for retry
+    # Scenario 36 - Delete API error preserves existing event
     # ----------------------------------------------------
-    async def mock_async_call_raise(domain, service, service_data, blocking=False, return_response=False):
+    original_delete_event = mock_cal_entity.async_delete_event
+    existing_uids_before = [event.uid for event in mock_cal_entity.events]
+
+    async def mock_delete_raise(
+        uid,
+        recurrence_id=None,
+        recurrence_range=None,
+    ):
+        raise ValueError("Calendar delete timed out")
+
+    mock_cal_entity.async_delete_event = mock_delete_raise
+
+    manager.robots["automowerkv5"].current_error_active = False
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.RECOVERED
+    manager.robots["automowervv14big"].current_error_active = False
+    manager.robots["automowervv14big"].recovery_state = RecoveryState.NONE
+
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+
+    assert res == "error"
+    assert manager.last_calendar_sync_result == "error"
+    assert "Calendar delete timed out" in manager.last_calendar_sync_error
+    assert [event.uid for event in mock_cal_entity.events] == existing_uids_before
+
+    mock_cal_entity.async_delete_event = original_delete_event
+
+    # ----------------------------------------------------
+    # Scenario 37 - Create API error caught and cached for retry
+    # ----------------------------------------------------
+    original_async_call = hass.services.async_call
+
+    # Force create_event: no existing managed event, but Kv5 still needs attention.
+    mock_cal_entity.events.clear()
+    manager.event_cache = {}
+
+    manager.robots["automowerkv5"].current_error_active = True
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.ACTIVE_ERROR
+    manager.robots["automowerkv5"].last_real_error = "Blade disc blocked"
+
+    async def mock_async_call_raise(
+        domain,
+        service,
+        service_data,
+        blocking=False,
+        return_response=False,
+    ):
         if domain == "calendar" and service == "create_event":
             raise ValueError("Create API connection timeout")
+
+        return await original_async_call(
+            domain,
+            service,
+            service_data,
+            blocking=blocking,
+            return_response=return_response,
+        )
+
     hass.services.async_call = mock_async_call_raise
-    
+
     res = await manager.async_run_morning_calendar_sync(t_morning)
+
     assert res == "error"
     assert manager.last_calendar_sync_result == "error"
-    
-    # Restore
-    hass.services.async_call = mock_async_call
-    
+    assert "Create API connection timeout" in manager.last_calendar_sync_error
+    assert len(mock_cal_entity.events) == 0
+
+    hass.services.async_call = original_async_call
+
     # ----------------------------------------------------
-    # Scenario 37 - Stockholm timezone handling (local datetime matching)
+    # Scenario 38 - Stockholm timezone handling (local datetime matching)
+
     # ----------------------------------------------------
     # Checked by get_stockholm_timezone returning Europe/Stockholm and setting tzinfo.
     

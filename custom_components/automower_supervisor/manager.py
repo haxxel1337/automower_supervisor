@@ -1262,27 +1262,58 @@ class AutomowerSupervisorManager:
                         is_morning=False,
                     )
 
-                    if existing_event:
-                        component = self.hass.data.get("calendar")
-                        entity = component.get_entity(entity_id) if component else None
-                        if entity and existing_event.get("uid"):
-                            await entity.async_delete_event(existing_event["uid"])
-                            result_code = "replaced"
-                    else:
-                        result_code = "created"
+                    component = self.hass.data.get("calendar")
+                    entity = component.get_entity(entity_id) if component else None
+                    if entity is None:
+                        raise RuntimeError(
+                            f"Calendar entity {entity_id} is not available in the calendar component"
+                        )
 
-                    await self.hass.services.async_call(
-                        "calendar",
-                        "create_event",
-                        {
-                            "entity_id": entity_id,
-                            "summary": title,
-                            "description": description,
-                            "start_date_time": event_start.strftime("%Y-%m-%d %H:%M:%S"),
-                            "end_date_time": event_end.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
-                        blocking=True,
-                    )
+                    from homeassistant.components.calendar.const import CalendarEntityFeature
+
+                    supported_features = entity.supported_features or 0
+                    if existing_event:
+                        if not supported_features & CalendarEntityFeature.UPDATE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support safe event updates; "
+                                "the existing event was preserved"
+                            )
+
+                        event_uid = existing_event.get("uid")
+                        if not event_uid:
+                            raise RuntimeError(
+                                "Existing managed calendar event has no UID; it was preserved"
+                            )
+
+                        await entity.async_update_event(
+                            event_uid,
+                            {
+                                "summary": title,
+                                "description": description,
+                                "start": event_start,
+                                "end": event_end,
+                            },
+                        )
+                        result_code = "updated"
+                    else:
+                        if not supported_features & CalendarEntityFeature.CREATE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support event creation"
+                            )
+
+                        await self.hass.services.async_call(
+                            "calendar",
+                            "create_event",
+                            {
+                                "entity_id": entity_id,
+                                "summary": title,
+                                "description": description,
+                                "start_date_time": event_start,
+                                "end_date_time": event_end,
+                            },
+                            blocking=True,
+                        )
+                        result_code = "created"
 
                     fetched = await async_fetch_managed_event(self.hass, entity_id, target_date_str)
                     if fetched:
@@ -1303,9 +1334,28 @@ class AutomowerSupervisorManager:
                     if existing_event:
                         component = self.hass.data.get("calendar")
                         entity = component.get_entity(entity_id) if component else None
-                        if entity and existing_event.get("uid"):
-                            await entity.async_delete_event(existing_event["uid"])
-                            result_code = "deleted"
+                        if entity is None:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} is not available in the calendar component"
+                            )
+
+                        from homeassistant.components.calendar.const import CalendarEntityFeature
+
+                        supported_features = entity.supported_features or 0
+                        if not supported_features & CalendarEntityFeature.DELETE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support event deletion; "
+                                "the existing event was preserved"
+                            )
+
+                        event_uid = existing_event.get("uid")
+                        if not event_uid:
+                            raise RuntimeError(
+                                "Existing managed calendar event has no UID; it was preserved"
+                            )
+
+                        await entity.async_delete_event(event_uid)
+                        result_code = "deleted"
                     self.event_cache = {}
 
                 self.last_calendar_sync_result = result_code
@@ -1476,27 +1526,58 @@ class AutomowerSupervisorManager:
                         is_morning=True,
                     )
 
-                    if existing_event:
-                        component = self.hass.data.get("calendar")
-                        entity = component.get_entity(entity_id) if component else None
-                        if entity and existing_event.get("uid"):
-                            await entity.async_delete_event(existing_event["uid"])
-                            result_code = "replaced"
-                    else:
-                        result_code = "created"
+                    component = self.hass.data.get("calendar")
+                    entity = component.get_entity(entity_id) if component else None
+                    if entity is None:
+                        raise RuntimeError(
+                            f"Calendar entity {entity_id} is not available in the calendar component"
+                        )
 
-                    await self.hass.services.async_call(
-                        "calendar",
-                        "create_event",
-                        {
-                            "entity_id": entity_id,
-                            "summary": title,
-                            "description": description,
-                            "start_date_time": event_start.strftime("%Y-%m-%d %H:%M:%S"),
-                            "end_date_time": event_end.strftime("%Y-%m-%d %H:%M:%S"),
-                        },
-                        blocking=True,
-                    )
+                    from homeassistant.components.calendar.const import CalendarEntityFeature
+
+                    supported_features = entity.supported_features or 0
+                    if existing_event:
+                        if not supported_features & CalendarEntityFeature.UPDATE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support safe event updates; "
+                                "the existing event was preserved"
+                            )
+
+                        event_uid = existing_event.get("uid")
+                        if not event_uid:
+                            raise RuntimeError(
+                                "Existing managed calendar event has no UID; it was preserved"
+                            )
+
+                        await entity.async_update_event(
+                            event_uid,
+                            {
+                                "summary": title,
+                                "description": description,
+                                "start": event_start,
+                                "end": event_end,
+                            },
+                        )
+                        result_code = "updated"
+                    else:
+                        if not supported_features & CalendarEntityFeature.CREATE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support event creation"
+                            )
+
+                        await self.hass.services.async_call(
+                            "calendar",
+                            "create_event",
+                            {
+                                "entity_id": entity_id,
+                                "summary": title,
+                                "description": description,
+                                "start_date_time": event_start,
+                                "end_date_time": event_end,
+                            },
+                            blocking=True,
+                        )
+                        result_code = "created"
 
                     fetched = await async_fetch_managed_event(self.hass, entity_id, current_date_str)
                     if fetched:
@@ -1517,9 +1598,28 @@ class AutomowerSupervisorManager:
                     if existing_event:
                         component = self.hass.data.get("calendar")
                         entity = component.get_entity(entity_id) if component else None
-                        if entity and existing_event.get("uid"):
-                            await entity.async_delete_event(existing_event["uid"])
-                            result_code = "deleted"
+                        if entity is None:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} is not available in the calendar component"
+                            )
+
+                        from homeassistant.components.calendar.const import CalendarEntityFeature
+
+                        supported_features = entity.supported_features or 0
+                        if not supported_features & CalendarEntityFeature.DELETE_EVENT:
+                            raise RuntimeError(
+                                f"Calendar entity {entity_id} does not support event deletion; "
+                                "the existing event was preserved"
+                            )
+
+                        event_uid = existing_event.get("uid")
+                        if not event_uid:
+                            raise RuntimeError(
+                                "Existing managed calendar event has no UID; it was preserved"
+                            )
+
+                        await entity.async_delete_event(event_uid)
+                        result_code = "deleted"
                     self.event_cache = {}
 
                 self.last_morning_sync_at = local_now.isoformat()

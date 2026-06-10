@@ -1,6 +1,19 @@
-# Automower Supervisor v0.5.0
+# Automower Supervisor v0.5.2
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.2
+
+- **Safe In-Place Calendar Updates**: Existing managed calendar events are updated with Home Assistant's `async_update_event()` when the selected calendar supports `UPDATE_EVENT`.
+- **No Delete-Before-Create Risk**: The integration no longer deletes an existing worklist before attempting to replace it. If a safe update is unsupported or fails, the existing calendar event is preserved.
+- **Calendar Feature Validation**: Explicitly checks support for `CREATE_EVENT`, `UPDATE_EVENT`, and `DELETE_EVENT` before performing calendar writes.
+- **Timezone-Aware Event Data**: Passes timezone-aware `datetime` objects to Home Assistant's calendar layer instead of formatted datetime strings.
+
+## Improvements in version 0.5.1
+
+- **Persistent Calendar Error Diagnostics**: Calendar synchronization errors and missing/unavailable calendar states are saved to persistent storage and remain visible after Home Assistant restarts.
+- **Accurate Managed Event Title**: `calendar_event_title` is only exposed when a managed event actually exists in `event_cache`, preventing stale titles after the event has been deleted.
+- **Maintenance Release**: Includes the first calendar safety and diagnostics fixes following the initial 0.5.0 calendar release.
 
 ## Improvements in version 0.5.0
 
