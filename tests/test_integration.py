@@ -3582,8 +3582,11 @@ async def test_version_0_5_2_scenarios() -> None:
     assert len(manager.calendar_snapshot.robots) == 3
     
     # ----------------------------------------------------
-    # Scenario 2 - Event start/end timing (12:00 - 12:30 next day)
+    # Scenario 2 - Explicit configured event time is preserved
     # ----------------------------------------------------
+    # This test configures calendar_event_start_time as 12:00 above.
+    # Version 0.5.5 changes only the default for new configurations to 12:20;
+    # it must not override an explicitly saved option.
     event = created_events[-1]
     assert event["start_date_time"] == datetime.datetime(
         2026, 6, 10, 12, 0, 0, tzinfo=tz
@@ -3643,8 +3646,8 @@ async def test_version_0_5_2_scenarios() -> None:
     # Place a mock event with marker in calendar
     mock_cal_entity.events.append(
         MockCalendarEvent(
-            start=datetime.datetime(2026, 6, 10, 12, 0, 0, tzinfo=tz),
-            end=datetime.datetime(2026, 6, 10, 12, 30, 0, tzinfo=tz),
+            start=datetime.datetime(2026, 6, 10, 12, 20, 0, tzinfo=tz),
+            end=datetime.datetime(2026, 6, 10, 12, 50, 0, tzinfo=tz),
             summary="Bot Kv5",
             description="[AUTOMOWER_SUPERVISOR:v1:2026-06-10]",
             uid="uid-to-delete",
@@ -3956,8 +3959,8 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Set timing variables
     tz_stockholm = tz
-    event_start = datetime.datetime(2026, 6, 10, 12, 0, 0, tzinfo=tz_stockholm)
-    event_end = datetime.datetime(2026, 6, 10, 12, 30, 0, tzinfo=tz_stockholm)
+    event_start = datetime.datetime(2026, 6, 10, 12, 20, 0, tzinfo=tz_stockholm)
+    event_end = datetime.datetime(2026, 6, 10, 12, 50, 0, tzinfo=tz_stockholm)
     
     mock_cal_entity.events.append(
         MockCalendarEvent(
@@ -4419,4 +4422,54 @@ async def test_charging_stalled_detection() -> None:
     state.current_status_plain = "Parked"
     assert update_charging_monitor(state, t0 + datetime.timedelta(minutes=40)) is True
     assert state.charging_started_at is None
+
+@pytest.mark.asyncio
+async def test_service_day_calendar_mapping() -> None:
+    """Calendar targets must be Monday, Wednesday, and Friday only."""
+    import zoneinfo
+
+    from custom_components.automower_supervisor.calendar_sync import (
+        get_next_service_date,
+        is_service_day,
+    )
+
+    tz = zoneinfo.ZoneInfo("Europe/Stockholm")
+
+    friday_after_cutoff = datetime.datetime(
+        2026, 6, 12, 11, 21, tzinfo=tz
+    )
+    monday_before_cutoff = datetime.datetime(
+        2026, 6, 15, 11, 20, tzinfo=tz
+    )
+    monday_after_cutoff = datetime.datetime(
+        2026, 6, 15, 11, 21, tzinfo=tz
+    )
+    wednesday_after_cutoff = datetime.datetime(
+        2026, 6, 17, 11, 21, tzinfo=tz
+    )
+
+    assert get_next_service_date(
+        friday_after_cutoff,
+        include_current=True,
+    ).isoformat() == "2026-06-15"
+
+    assert get_next_service_date(
+        monday_before_cutoff,
+        include_current=True,
+    ).isoformat() == "2026-06-15"
+
+    assert get_next_service_date(
+        monday_after_cutoff,
+        include_current=True,
+    ).isoformat() == "2026-06-17"
+
+    assert get_next_service_date(
+        wednesday_after_cutoff,
+        include_current=True,
+    ).isoformat() == "2026-06-19"
+
+    assert is_service_day(datetime.date(2026, 6, 15)) is True
+    assert is_service_day(datetime.date(2026, 6, 16)) is False
+    assert is_service_day(datetime.date(2026, 6, 17)) is True
+    assert is_service_day(datetime.date(2026, 6, 20)) is False
 

@@ -16,6 +16,37 @@ from .models import RobotState, RecoveryState
 _LOGGER = logging.getLogger(__name__)
 
 
+SERVICE_WEEKDAYS = {0, 2, 4}  # Monday, Wednesday, Friday
+
+
+def is_service_day(value) -> bool:
+    """Return True for Monday, Wednesday, or Friday."""
+    return value.weekday() in SERVICE_WEEKDAYS
+
+
+def get_next_service_date(
+    now: datetime,
+    *,
+    include_current: bool,
+):
+    """Return the next Monday, Wednesday, or Friday service date.
+
+    Current date is returned only when include_current is True, today is a
+    service day, and local time has not passed the 11:20 reconciliation.
+    """
+    local_now = now.astimezone(get_stockholm_timezone())
+    candidate = local_now.date()
+
+    if include_current and is_service_day(candidate):
+        if (local_now.hour, local_now.minute) <= (11, 20):
+            return candidate
+
+    candidate += timedelta(days=1)
+    while not is_service_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
 @dataclass
 class CalendarRobotSnapshot:
     """Snapshot of a robot needing attention at evening sync."""

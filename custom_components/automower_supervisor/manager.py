@@ -1144,84 +1144,248 @@ class AutomowerSupervisorManager:
         is_before_cutoff = (now.hour < 12) or (now.hour == 12 and now.minute == 0)
 
         last_mo_date = get_date_part(self.last_morning_sync_at)
-        if is_after_morning and is_before_cutoff and last_mo_date != current_date_str:
-            _LOGGER.info("Startup catch-up: Morning sync was missed today (last sync: %s). Running now...", self.last_morning_sync_at)
+        from .calendar_sync import is_service_day
+
+        if (
+            is_service_day(now.date())
+            and is_after_morning
+            and is_before_cutoff
+            and last_mo_date != current_date_str
+        ):
+            _LOGGER.info(
+                "Startup catch-up: Service-day morning sync was missed "
+                "(last sync: %s). Running now...",
+                self.last_morning_sync_at,
+            )
             await self.async_run_morning_calendar_sync(now)
 
+    async def _async_validate_calendar_entity(
+        self,
+        entity_id: str | None,
+    ) -> str | None:
+        """Validate the configured calendar and persist any failure result."""
+        if not entity_id:
+            result = "calendar_entity_missing"
+        else:
+            calendar_state = self.hass.states.get(entity_id)
+            if calendar_state is None:
+                result = "calendar_entity_missing"
+            elif calendar_state.state == "unavailable":
+                result = "calendar_entity_unavailable"
+            else:
+                return None
+
+        self.last_calendar_sync_result = result
+        self.last_calendar_sync_error = None
+        self.last_calendar_sync_at = dt_util.now().isoformat()
+        await self._storage.async_save(self.get_storage_data())
+        self._notify_callbacks()
+        return result
+
+    def _parse_calendar_event_start_time(self) -> tuple[int, int]:
+        """Parse configured event start time, falling back to 12:20."""
+        try:
+            hour, minute = map(
+                int,
+                self.calendar_event_start_time.split(":"),
+            )
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+            return hour, minute
+        except (TypeError, ValueError):
+            return 12, 20
+
+    async def _async_upsert_managed_calendar_event(
+        self,
+        *,
+        entity_id: str,
+        existing_event: dict | None,
+        title: str,
+        description: str,
+        event_start: datetime,
+        event_end: datetime,
+    ) -> str:
+        """Create, update, or safely replace a managed calendar event."""
+        from homeassistant.components.calendar.const import (
+            CalendarEntityFeature,
+        )
+
+        component = self.hass.data.get("calendar")
+        entity = component.get_entity(entity_id) if component else None
+        if entity is None:
+            raise RuntimeError(
+                f"Calendar entity {entity_id} is not available "
+                "in the calendar component"
+            )
+
+        supported_features = entity.supported_features or 0
+        event_payload = {
+            "summary": title,
+            "description": description,
+            "start": event_start,
+            "end": event_end,
+        }
+
+        if existing_event:
+            event_uid = existing_event.get("uid")
+            if not event_uid:
+                raise RuntimeError(
+                    "Existing managed calendar event has no UID; "
+                    "it was preserved"
+                )
+
+            if supported_features & CalendarEntityFeature.UPDATE_EVENT:
+                await entity.async_update_event(event_uid, event_payload)
+                return "updated"
+
+            if not (
+                supported_features & CalendarEntityFeature.CREATE_EVENT
+                and supported_features & CalendarEntityFeature.DELETE_EVENT
+            ):
+                raise RuntimeError(
+                    f"Calendar entity {entity_id} supports neither direct "
+                    "updates nor safe create-before-delete replacement; "
+                    "the existing event was preserved"
+                )
+
+            # Create first. Delete the old event only after creation succeeds.
+            await self.hass.services.async_call(
+                "calendar",
+                "create_event",
+                {
+                    "entity_id": entity_id,
+                    "summary": title,
+                    "description": description,
+                    "start_date_time": event_start,
+                    "end_date_time": event_end,
+                },
+                blocking=True,
+            )
+            await entity.async_delete_event(event_uid)
+            return "replaced_safely"
+
+        if not supported_features & CalendarEntityFeature.CREATE_EVENT:
+            raise RuntimeError(
+                f"Calendar entity {entity_id} does not support event creation"
+            )
+
+        await self.hass.services.async_call(
+            "calendar",
+            "create_event",
+            {
+                "entity_id": entity_id,
+                "summary": title,
+                "description": description,
+                "start_date_time": event_start,
+                "end_date_time": event_end,
+            },
+            blocking=True,
+        )
+        return "created"
+
+    async def _async_delete_managed_event(
+        self,
+        entity_id: str,
+        existing_event: dict | None,
+    ) -> str:
+        """Delete the managed event if one exists."""
+        if not existing_event:
+            return "no_event_needed"
+
+        from homeassistant.components.calendar.const import (
+            CalendarEntityFeature,
+        )
+
+        component = self.hass.data.get("calendar")
+        entity = component.get_entity(entity_id) if component else None
+        if entity is None:
+            raise RuntimeError(
+                f"Calendar entity {entity_id} is not available "
+                "in the calendar component"
+            )
+
+        if not (
+            (entity.supported_features or 0)
+            & CalendarEntityFeature.DELETE_EVENT
+        ):
+            raise RuntimeError(
+                f"Calendar entity {entity_id} does not support event deletion; "
+                "the existing event was preserved"
+            )
+
+        event_uid = existing_event.get("uid")
+        if not event_uid:
+            raise RuntimeError(
+                "Existing managed calendar event has no UID; "
+                "it was preserved"
+            )
+
+        await entity.async_delete_event(event_uid)
+        return "deleted"
+
     async def async_run_evening_calendar_sync(self, now: datetime) -> str:
-        """Run the evening sync flow to create/update calendar event for next day."""
+        """Run evening sync and maintain one worklist for the next service day."""
         if not self.calendar_enabled:
             return "disabled"
 
         entity_id = self.calendar_entity_id
-        if not entity_id:
-            self.last_calendar_sync_result = "calendar_entity_missing"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_missing"
-
-        cal_state = self.hass.states.get(entity_id)
-        if cal_state is None:
-            self.last_calendar_sync_result = "calendar_entity_missing"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_missing"
-        if cal_state.state == "unavailable":
-            self.last_calendar_sync_result = "calendar_entity_unavailable"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_unavailable"
+        validation_result = await self._async_validate_calendar_entity(entity_id)
+        if validation_result is not None:
+            return validation_result
 
         async with self._calendar_sync_lock:
             try:
                 from .calendar_sync import (
                     CalendarRobotSnapshot,
                     EveningAttentionSnapshot,
-                    get_stockholm_timezone,
+                    async_fetch_managed_event,
                     build_calendar_description,
                     get_evening_problem_desc,
-                    async_fetch_managed_event,
+                    get_next_service_date,
+                    get_stockholm_timezone,
                 )
 
                 tz = get_stockholm_timezone()
                 local_now = now.astimezone(tz)
                 source_date_str = local_now.date().isoformat()
-
-                target_date = local_now.date() + timedelta(days=1)
+                target_date = get_next_service_date(
+                    local_now,
+                    include_current=False,
+                )
                 target_date_str = target_date.isoformat()
 
                 self.evaluate_all_daily_attention(now)
 
                 attention_robots = []
                 for robot_id, state in self.robots.items():
-                    if state.daily_attention_required:
-                        severity = "warning"
-                        code = state.daily_attention_reason_codes[0] if state.daily_attention_reason_codes else ""
-                        if code in (
-                            "ACTIVE_ERROR",
-                            "CLEARED_BUT_UNVERIFIED",
-                            "FAILED_RECOVERY",
-                            "ROBOT_OFFLINE",
-                            "SESSION_LOST_OFFLINE",
-                            "ERROR_DURING_MOWING",
-                            "ERROR_AFTER_MOWING",
-                        ):
-                            severity = "critical"
+                    if not state.daily_attention_required:
+                        continue
 
-                        snap = CalendarRobotSnapshot(
+                    severity = "warning"
+                    code = (
+                        state.daily_attention_reason_codes[0]
+                        if state.daily_attention_reason_codes
+                        else ""
+                    )
+                    if code in (
+                        "ACTIVE_ERROR",
+                        "CLEARED_BUT_UNVERIFIED",
+                        "FAILED_RECOVERY",
+                        "ROBOT_OFFLINE",
+                        "SESSION_LOST_OFFLINE",
+                        "ERROR_DURING_MOWING",
+                        "ERROR_AFTER_MOWING",
+                    ):
+                        severity = "critical"
+
+                    attention_robots.append(
+                        CalendarRobotSnapshot(
                             robot_id=robot_id,
                             display_name=state.display_name,
                             severity=severity,
-                            reason_codes=list(state.daily_attention_reason_codes),
+                            reason_codes=list(
+                                state.daily_attention_reason_codes
+                            ),
                             text=state.daily_attention_text or "",
                             captured_at=local_now.isoformat(),
                             current_status_plain=state.current_status_plain,
@@ -1229,9 +1393,11 @@ class AutomowerSupervisorManager:
                             online=state.online,
                             last_real_error=state.last_real_error,
                             recovery_state=str(state.recovery_state.value),
-                            last_mowing_attempt_result=state.last_mowing_attempt_result,
+                            last_mowing_attempt_result=(
+                                state.last_mowing_attempt_result
+                            ),
                         )
-                        attention_robots.append(snap)
+                    )
 
                 snapshot = EveningAttentionSnapshot(
                     source_date=source_date_str,
@@ -1239,145 +1405,90 @@ class AutomowerSupervisorManager:
                     captured_at=local_now.isoformat(),
                     robots=attention_robots,
                 )
-
                 self.calendar_snapshot = snapshot
                 self.last_evening_sync_at = local_now.isoformat()
-                await self._storage.async_save(self.get_storage_data())
 
-                existing_event = await async_fetch_managed_event(self.hass, entity_id, target_date_str)
+                existing_event = await async_fetch_managed_event(
+                    self.hass,
+                    entity_id,
+                    target_date_str,
+                )
 
                 from .const import ROBOTS
-                sorted_robots = []
-                for r_id in ROBOTS:
-                    for r in attention_robots:
-                        if r.robot_id == r_id:
-                            sorted_robots.append(r)
-                            break
 
-                result_code = "no_event_needed"
+                robots_by_id = {
+                    robot.robot_id: robot for robot in attention_robots
+                }
+                sorted_robots = [
+                    robots_by_id[robot_id]
+                    for robot_id in ROBOTS
+                    if robot_id in robots_by_id
+                ]
 
-                start_time_str = self.calendar_event_start_time
-                duration_mins = self.calendar_event_duration_minutes
-                try:
-                    start_h, start_m = map(int, start_time_str.split(":"))
-                except Exception:
-                    start_h, start_m = 12, 0
-
-                event_start = datetime.fromisoformat(f"{target_date_str}T{start_h:02d}:{start_m:02d}:00").replace(tzinfo=tz)
-                event_end = event_start + timedelta(minutes=duration_mins)
+                start_h, start_m = self._parse_calendar_event_start_time()
+                event_start = datetime.fromisoformat(
+                    f"{target_date_str}T{start_h:02d}:{start_m:02d}:00"
+                ).replace(tzinfo=tz)
+                event_end = event_start + timedelta(
+                    minutes=self.calendar_event_duration_minutes
+                )
 
                 if sorted_robots:
-                    title = "Bot " + ", ".join([r.display_name for r in sorted_robots])
-                    robots_data = []
-                    for r in sorted_robots:
-                        robots_data.append({
-                            "display_name": r.display_name,
-                            "evening_text": get_evening_problem_desc(r),
-                            "current_status": r.current_status_plain or "saknas",
-                            "battery": r.current_battery,
-                        })
-
+                    title = "Bot " + ", ".join(
+                        robot.display_name for robot in sorted_robots
+                    )
+                    robots_data = [
+                        {
+                            "display_name": robot.display_name,
+                            "evening_text": get_evening_problem_desc(robot),
+                            "current_status": (
+                                robot.current_status_plain or "saknas"
+                            ),
+                            "battery": robot.current_battery,
+                        }
+                        for robot in sorted_robots
+                    ]
                     description = build_calendar_description(
                         robots_data=robots_data,
-                        sync_time_str=local_now.strftime("%Y-%m-%d %H:%M"),
+                        sync_time_str=local_now.strftime(
+                            "%Y-%m-%d %H:%M"
+                        ),
                         date_str=target_date_str,
                         is_morning=False,
                     )
 
-                    component = self.hass.data.get("calendar")
-                    entity = component.get_entity(entity_id) if component else None
-                    if entity is None:
-                        raise RuntimeError(
-                            f"Calendar entity {entity_id} is not available in the calendar component"
+                    result_code = (
+                        await self._async_upsert_managed_calendar_event(
+                            entity_id=entity_id,
+                            existing_event=existing_event,
+                            title=title,
+                            description=description,
+                            event_start=event_start,
+                            event_end=event_end,
                         )
+                    )
 
-                    from homeassistant.components.calendar.const import CalendarEntityFeature
-
-                    supported_features = entity.supported_features or 0
-                    if existing_event:
-                        if not supported_features & CalendarEntityFeature.UPDATE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support safe event updates; "
-                                "the existing event was preserved"
-                            )
-
-                        event_uid = existing_event.get("uid")
-                        if not event_uid:
-                            raise RuntimeError(
-                                "Existing managed calendar event has no UID; it was preserved"
-                            )
-
-                        await entity.async_update_event(
-                            event_uid,
-                            {
-                                "summary": title,
-                                "description": description,
-                                "start": event_start,
-                                "end": event_end,
-                            },
-                        )
-                        result_code = "updated"
-                    else:
-                        if not supported_features & CalendarEntityFeature.CREATE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support event creation"
-                            )
-
-                        await self.hass.services.async_call(
-                            "calendar",
-                            "create_event",
-                            {
-                                "entity_id": entity_id,
-                                "summary": title,
-                                "description": description,
-                                "start_date_time": event_start,
-                                "end_date_time": event_end,
-                            },
-                            blocking=True,
-                        )
-                        result_code = "created"
-
-                    fetched = await async_fetch_managed_event(self.hass, entity_id, target_date_str)
-                    if fetched:
-                        self.event_cache = {
-                            "date": target_date_str,
-                            "uid": fetched.get("uid"),
-                            "event_id": fetched.get("uid"),
-                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{target_date_str}]",
-                        }
-                    else:
-                        self.event_cache = {
-                            "date": target_date_str,
-                            "uid": None,
-                            "event_id": None,
-                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{target_date_str}]",
-                        }
+                    fetched = await async_fetch_managed_event(
+                        self.hass,
+                        entity_id,
+                        target_date_str,
+                    )
+                    self.event_cache = {
+                        "date": target_date_str,
+                        "uid": fetched.get("uid") if fetched else None,
+                        "event_id": (
+                            fetched.get("uid") if fetched else None
+                        ),
+                        "marker": (
+                            f"[AUTOMOWER_SUPERVISOR:v1:"
+                            f"{target_date_str}]"
+                        ),
+                    }
                 else:
-                    if existing_event:
-                        component = self.hass.data.get("calendar")
-                        entity = component.get_entity(entity_id) if component else None
-                        if entity is None:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} is not available in the calendar component"
-                            )
-
-                        from homeassistant.components.calendar.const import CalendarEntityFeature
-
-                        supported_features = entity.supported_features or 0
-                        if not supported_features & CalendarEntityFeature.DELETE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support event deletion; "
-                                "the existing event was preserved"
-                            )
-
-                        event_uid = existing_event.get("uid")
-                        if not event_uid:
-                            raise RuntimeError(
-                                "Existing managed calendar event has no UID; it was preserved"
-                            )
-
-                        await entity.async_delete_event(event_uid)
-                        result_code = "deleted"
+                    result_code = await self._async_delete_managed_event(
+                        entity_id,
+                        existing_event,
+                    )
                     self.event_cache = {}
 
                 self.last_calendar_sync_result = result_code
@@ -1393,90 +1504,95 @@ class AutomowerSupervisorManager:
                 self.last_calendar_sync_result = "error"
                 self.last_calendar_sync_error = str(err)
                 self.last_calendar_sync_at = dt_util.now().isoformat()
-
                 await self._storage.async_save(self.get_storage_data())
                 self._notify_callbacks()
                 return "error"
 
     async def async_run_morning_calendar_sync(self, now: datetime) -> str:
-        """Run the morning sync flow to reconcile evening snapshot and current state."""
+        """Reconcile the worklist at 11:20 on Monday, Wednesday, or Friday."""
         if not self.calendar_enabled:
             return "disabled"
 
         entity_id = self.calendar_entity_id
-        if not entity_id:
-            self.last_calendar_sync_result = "calendar_entity_missing"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_missing"
-
-        cal_state = self.hass.states.get(entity_id)
-        if cal_state is None:
-            self.last_calendar_sync_result = "calendar_entity_missing"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_missing"
-        if cal_state.state == "unavailable":
-            self.last_calendar_sync_result = "calendar_entity_unavailable"
-            self.last_calendar_sync_error = None
-            self.last_calendar_sync_at = dt_util.now().isoformat()
-
-            await self._storage.async_save(self.get_storage_data())
-            self._notify_callbacks()
-            return "calendar_entity_unavailable"
+        validation_result = await self._async_validate_calendar_entity(entity_id)
+        if validation_result is not None:
+            return validation_result
 
         async with self._calendar_sync_lock:
             try:
                 from .calendar_sync import (
-                    get_stockholm_timezone,
-                    evaluate_morning_resolution,
-                    build_calendar_description,
-                    get_evening_problem_desc,
                     async_fetch_managed_event,
+                    build_calendar_description,
+                    evaluate_morning_resolution,
+                    get_evening_problem_desc,
+                    get_stockholm_timezone,
+                    is_service_day,
                 )
 
                 tz = get_stockholm_timezone()
                 local_now = now.astimezone(tz)
                 current_date_str = local_now.date().isoformat()
 
+                if not is_service_day(local_now.date()):
+                    self.last_morning_sync_at = local_now.isoformat()
+                    self.last_calendar_sync_result = "not_service_day"
+                    self.last_calendar_sync_error = None
+                    self.last_calendar_sync_at = local_now.isoformat()
+                    await self._storage.async_save(self.get_storage_data())
+                    self._notify_callbacks()
+                    return "not_service_day"
+
                 snapshot = self.calendar_snapshot
                 snapshot_robots_by_id = {}
-                if snapshot and snapshot.target_calendar_date == current_date_str:
-                    snapshot_robots_by_id = {r.robot_id: r for r in snapshot.robots}
-                else:
-                    _LOGGER.info(
-                        "No matching evening snapshot for today's morning sync (snapshot target: %s, today: %s)",
-                        snapshot.target_calendar_date if snapshot else None,
-                        current_date_str,
-                    )
+                if (
+                    snapshot
+                    and snapshot.target_calendar_date == current_date_str
+                ):
+                    snapshot_robots_by_id = {
+                        robot.robot_id: robot for robot in snapshot.robots
+                    }
 
                 remaining_robots_data = []
                 morning_remaining_robot_ids = []
                 morning_resolved_robot_ids = []
 
-                for robot_id, snap_r in snapshot_robots_by_id.items():
+                for robot_id, snapshot_robot in (
+                    snapshot_robots_by_id.items()
+                ):
                     current_state = self.robots[robot_id]
-                    res = evaluate_morning_resolution(snap_r, current_state, local_now)
-                    if res.keep:
+                    resolution = evaluate_morning_resolution(
+                        snapshot_robot,
+                        current_state,
+                        local_now,
+                    )
+                    if resolution.keep:
                         morning_remaining_robot_ids.append(robot_id)
-                        remaining_robots_data.append({
-                            "robot_id": robot_id,
-                            "display_name": current_state.display_name,
-                            "evening_text": get_evening_problem_desc(snap_r),
-                            "current_status": current_state.current_status_plain or current_state.current_status or "saknas",
-                            "battery": current_state.current_battery,
-                            "recovery_state": str(current_state.recovery_state.value) if current_state.recovery_state != RecoveryState.NONE else "none",
-                            "morning_status_text": res.text,
-                        })
+                        remaining_robots_data.append(
+                            {
+                                "robot_id": robot_id,
+                                "display_name": current_state.display_name,
+                                "evening_text": get_evening_problem_desc(
+                                    snapshot_robot
+                                ),
+                                "current_status": (
+                                    current_state.current_status_plain
+                                    or current_state.current_status
+                                    or "saknas"
+                                ),
+                                "battery": current_state.current_battery,
+                                "recovery_state": (
+                                    str(current_state.recovery_state.value)
+                                    if current_state.recovery_state
+                                    != RecoveryState.NONE
+                                    else "none"
+                                ),
+                                "morning_status_text": resolution.text,
+                            }
+                        )
                     else:
                         morning_resolved_robot_ids.append(robot_id)
 
+                # Include critical problems discovered after evening sync.
                 for robot_id, current_state in self.robots.items():
                     if robot_id in snapshot_robots_by_id:
                         continue
@@ -1484,164 +1600,151 @@ class AutomowerSupervisorManager:
                     is_critical_now = (
                         current_state.current_error_active is True
                         or current_state.binary_error == "on"
-                        or current_state.recovery_state in (RecoveryState.ACTIVE_ERROR, RecoveryState.CLEARED_BUT_UNVERIFIED)
+                        or current_state.recovery_state
+                        in (
+                            RecoveryState.ACTIVE_ERROR,
+                            RecoveryState.CLEARED_BUT_UNVERIFIED,
+                        )
                         or current_state.failed_recovery is True
                         or current_state.online is False
+                        or current_state.charging_stalled is True
                     )
+                    if not is_critical_now:
+                        continue
 
-                    if is_critical_now:
-                        morning_remaining_robot_ids.append(robot_id)
+                    morning_remaining_robot_ids.append(robot_id)
+                    if current_state.charging_stalled:
+                        morning_status_text = (
+                            "Roboten står som Charging men batteriet minskar."
+                        )
+                    elif current_state.online is False:
+                        morning_status_text = "Roboten är offline."
+                    elif (
+                        current_state.current_error_active is True
+                        or current_state.binary_error == "on"
+                        or current_state.recovery_state
+                        == RecoveryState.ACTIVE_ERROR
+                    ):
+                        morning_status_text = (
+                            f"Aktivt fel "
+                            f"\"{current_state.last_real_error or 'Okänt fel'}\"."
+                        )
+                    elif (
+                        current_state.recovery_state
+                        == RecoveryState.CLEARED_BUT_UNVERIFIED
+                    ):
+                        morning_status_text = (
+                            f"Tidigare fel "
+                            f"\"{current_state.last_real_error or 'Okänt fel'}\" "
+                            "är nollställt men inte verifierat återställt."
+                        )
+                    else:
+                        morning_status_text = (
+                            "Misslyckad återhämtning efter fel."
+                        )
 
-                        if current_state.online is False:
-                            morning_status_text = "Roboten är offline."
-                        elif current_state.current_error_active is True or current_state.binary_error == "on" or current_state.recovery_state == RecoveryState.ACTIVE_ERROR:
-                            morning_status_text = f"Aktivt fel \"{current_state.last_real_error or 'Okänt fel'}\"."
-                        elif current_state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-                            morning_status_text = f"Tidigare fel \"{current_state.last_real_error or 'Okänt fel'}\" är nollställt men inte verifierat återställt."
-                        elif current_state.failed_recovery is True:
-                            morning_status_text = "Misslyckad återhämtning efter fel."
-                        else:
-                            morning_status_text = "Kritiskt problem upptäckt under natten."
-
-                        remaining_robots_data.append({
+                    remaining_robots_data.append(
+                        {
                             "robot_id": robot_id,
                             "display_name": current_state.display_name,
-                            "evening_text": "Inget problem rapporterat igår kväll.",
-                            "current_status": current_state.current_status_plain or current_state.current_status or "saknas",
+                            "evening_text": (
+                                "Problem upptäckt efter senaste kvällssynken."
+                            ),
+                            "current_status": (
+                                current_state.current_status_plain
+                                or current_state.current_status
+                                or "saknas"
+                            ),
                             "battery": current_state.current_battery,
-                            "recovery_state": str(current_state.recovery_state.value) if current_state.recovery_state != RecoveryState.NONE else "none",
+                            "recovery_state": (
+                                str(current_state.recovery_state.value)
+                                if current_state.recovery_state
+                                != RecoveryState.NONE
+                                else "none"
+                            ),
                             "morning_status_text": morning_status_text,
-                        })
+                        }
+                    )
 
                 from .const import ROBOTS
-                sorted_remaining_data = []
-                for r_id in ROBOTS:
-                    for r_data in remaining_robots_data:
-                        if r_data["robot_id"] == r_id:
-                            sorted_remaining_data.append(r_data)
-                            break
+
+                remaining_by_id = {
+                    item["robot_id"]: item
+                    for item in remaining_robots_data
+                }
+                sorted_remaining_data = [
+                    remaining_by_id[robot_id]
+                    for robot_id in ROBOTS
+                    if robot_id in remaining_by_id
+                ]
 
                 self.morning_reconciled_at = local_now.isoformat()
-                self.morning_remaining_robot_ids = morning_remaining_robot_ids
-                self.morning_resolved_robot_ids = morning_resolved_robot_ids
+                self.morning_remaining_robot_ids = list(
+                    dict.fromkeys(morning_remaining_robot_ids)
+                )
+                self.morning_resolved_robot_ids = list(
+                    dict.fromkeys(morning_resolved_robot_ids)
+                )
 
-                existing_event = await async_fetch_managed_event(self.hass, entity_id, current_date_str)
+                existing_event = await async_fetch_managed_event(
+                    self.hass,
+                    entity_id,
+                    current_date_str,
+                )
 
-                result_code = "no_event_needed"
-
-                start_time_str = self.calendar_event_start_time
-                duration_mins = self.calendar_event_duration_minutes
-                try:
-                    start_h, start_m = map(int, start_time_str.split(":"))
-                except Exception:
-                    start_h, start_m = 12, 0
-
-                event_start = datetime.fromisoformat(f"{current_date_str}T{start_h:02d}:{start_m:02d}:00").replace(tzinfo=tz)
-                event_end = event_start + timedelta(minutes=duration_mins)
+                start_h, start_m = self._parse_calendar_event_start_time()
+                event_start = datetime.fromisoformat(
+                    f"{current_date_str}T{start_h:02d}:{start_m:02d}:00"
+                ).replace(tzinfo=tz)
+                event_end = event_start + timedelta(
+                    minutes=self.calendar_event_duration_minutes
+                )
 
                 if sorted_remaining_data:
-                    title = "Bot " + ", ".join([r["display_name"] for r in sorted_remaining_data])
+                    title = "Bot " + ", ".join(
+                        item["display_name"]
+                        for item in sorted_remaining_data
+                    )
                     description = build_calendar_description(
                         robots_data=sorted_remaining_data,
-                        sync_time_str=local_now.strftime("%Y-%m-%d %H:%M"),
+                        sync_time_str=local_now.strftime(
+                            "%Y-%m-%d %H:%M"
+                        ),
                         date_str=current_date_str,
                         is_morning=True,
                     )
-
-                    component = self.hass.data.get("calendar")
-                    entity = component.get_entity(entity_id) if component else None
-                    if entity is None:
-                        raise RuntimeError(
-                            f"Calendar entity {entity_id} is not available in the calendar component"
+                    result_code = (
+                        await self._async_upsert_managed_calendar_event(
+                            entity_id=entity_id,
+                            existing_event=existing_event,
+                            title=title,
+                            description=description,
+                            event_start=event_start,
+                            event_end=event_end,
                         )
+                    )
 
-                    from homeassistant.components.calendar.const import CalendarEntityFeature
-
-                    supported_features = entity.supported_features or 0
-                    if existing_event:
-                        if not supported_features & CalendarEntityFeature.UPDATE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support safe event updates; "
-                                "the existing event was preserved"
-                            )
-
-                        event_uid = existing_event.get("uid")
-                        if not event_uid:
-                            raise RuntimeError(
-                                "Existing managed calendar event has no UID; it was preserved"
-                            )
-
-                        await entity.async_update_event(
-                            event_uid,
-                            {
-                                "summary": title,
-                                "description": description,
-                                "start": event_start,
-                                "end": event_end,
-                            },
-                        )
-                        result_code = "updated"
-                    else:
-                        if not supported_features & CalendarEntityFeature.CREATE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support event creation"
-                            )
-
-                        await self.hass.services.async_call(
-                            "calendar",
-                            "create_event",
-                            {
-                                "entity_id": entity_id,
-                                "summary": title,
-                                "description": description,
-                                "start_date_time": event_start,
-                                "end_date_time": event_end,
-                            },
-                            blocking=True,
-                        )
-                        result_code = "created"
-
-                    fetched = await async_fetch_managed_event(self.hass, entity_id, current_date_str)
-                    if fetched:
-                        self.event_cache = {
-                            "date": current_date_str,
-                            "uid": fetched.get("uid"),
-                            "event_id": fetched.get("uid"),
-                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{current_date_str}]",
-                        }
-                    else:
-                        self.event_cache = {
-                            "date": current_date_str,
-                            "uid": None,
-                            "event_id": None,
-                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{current_date_str}]",
-                        }
+                    fetched = await async_fetch_managed_event(
+                        self.hass,
+                        entity_id,
+                        current_date_str,
+                    )
+                    self.event_cache = {
+                        "date": current_date_str,
+                        "uid": fetched.get("uid") if fetched else None,
+                        "event_id": (
+                            fetched.get("uid") if fetched else None
+                        ),
+                        "marker": (
+                            f"[AUTOMOWER_SUPERVISOR:v1:"
+                            f"{current_date_str}]"
+                        ),
+                    }
                 else:
-                    if existing_event:
-                        component = self.hass.data.get("calendar")
-                        entity = component.get_entity(entity_id) if component else None
-                        if entity is None:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} is not available in the calendar component"
-                            )
-
-                        from homeassistant.components.calendar.const import CalendarEntityFeature
-
-                        supported_features = entity.supported_features or 0
-                        if not supported_features & CalendarEntityFeature.DELETE_EVENT:
-                            raise RuntimeError(
-                                f"Calendar entity {entity_id} does not support event deletion; "
-                                "the existing event was preserved"
-                            )
-
-                        event_uid = existing_event.get("uid")
-                        if not event_uid:
-                            raise RuntimeError(
-                                "Existing managed calendar event has no UID; it was preserved"
-                            )
-
-                        await entity.async_delete_event(event_uid)
-                        result_code = "deleted"
+                    result_code = await self._async_delete_managed_event(
+                        entity_id,
+                        existing_event,
+                    )
                     self.event_cache = {}
 
                 self.last_morning_sync_at = local_now.isoformat()
@@ -1658,7 +1761,6 @@ class AutomowerSupervisorManager:
                 self.last_calendar_sync_result = "error"
                 self.last_calendar_sync_error = str(err)
                 self.last_calendar_sync_at = dt_util.now().isoformat()
-
                 await self._storage.async_save(self.get_storage_data())
                 self._notify_callbacks()
                 return "error"
@@ -1690,25 +1792,65 @@ class AutomowerSupervisorManager:
         )
 
         async def delete_managed_calendar_event_service(call):
+            """Delete all managed Automower events in the relevant service window."""
             entity_id = self.calendar_entity_id
             if not entity_id:
                 return
-            
-            from .calendar_sync import get_stockholm_timezone, async_fetch_managed_event
+
+            from .calendar_sync import (
+                async_fetch_managed_event,
+                get_stockholm_timezone,
+            )
+
             tz = get_stockholm_timezone()
-            now = dt_util.now()
-            local_now = now.astimezone(tz)
-            
-            for offset in (0, 1):
-                date_str = (local_now.date() + timedelta(days=offset)).isoformat()
-                existing_event = await async_fetch_managed_event(self.hass, entity_id, date_str)
-                if existing_event:
-                    component = self.hass.data.get("calendar")
-                    entity = component.get_entity(entity_id) if component else None
-                    if entity and existing_event.get("uid"):
-                        await entity.async_delete_event(existing_event["uid"])
-            
+            local_now = dt_util.now().astimezone(tz)
+
+            component = self.hass.data.get("calendar")
+            entity = component.get_entity(entity_id) if component else None
+            if entity is None:
+                raise RuntimeError(
+                    f"Calendar entity {entity_id} is not available "
+                    "in the calendar component"
+                )
+
+            candidate_dates: set[str] = set()
+
+            cached_date = self.event_cache.get("date")
+            if cached_date:
+                candidate_dates.add(cached_date)
+
+            if self.calendar_snapshot is not None:
+                snapshot_date = self.calendar_snapshot.target_calendar_date
+                if snapshot_date:
+                    candidate_dates.add(snapshot_date)
+
+            for offset in range(-1, 8):
+                candidate_dates.add(
+                    (
+                        local_now.date() + timedelta(days=offset)
+                    ).isoformat()
+                )
+
+            deleted_uids: set[str] = set()
+
+            for date_str in sorted(candidate_dates):
+                existing_event = await async_fetch_managed_event(
+                    self.hass,
+                    entity_id,
+                    date_str,
+                )
+                if not existing_event:
+                    continue
+
+                event_uid = existing_event.get("uid")
+                if not event_uid or event_uid in deleted_uids:
+                    continue
+
+                await entity.async_delete_event(event_uid)
+                deleted_uids.add(event_uid)
+
             self.event_cache = {}
+            self.calendar_snapshot = None
             await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
 
