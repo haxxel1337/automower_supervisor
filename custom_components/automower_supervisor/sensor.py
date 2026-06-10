@@ -617,10 +617,15 @@ class AutomowerSupervisorSummarySensor(SensorEntity):
         attrs["managed_event_uid"] = cache.get("uid")
         
         title = None
-        if morning_names:
-            title = "Bot " + ", ".join(morning_names)
-        elif evening_names:
-            title = "Bot " + ", ".join(evening_names)
+
+        # Visa endast en titel när integrationen faktiskt har en
+        # hanterad kalenderpost kvar i event_cache.
+        if cache.get("date"):
+            if morning_names:
+                title = "Bot " + ", ".join(morning_names)
+            elif evening_names:
+                title = "Bot " + ", ".join(evening_names)
+
         attrs["calendar_event_title"] = title
         
         return attrs

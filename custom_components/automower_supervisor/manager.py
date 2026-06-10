@@ -1134,19 +1134,28 @@ class AutomowerSupervisorManager:
         entity_id = self.calendar_entity_id
         if not entity_id:
             self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_missing"
 
         cal_state = self.hass.states.get(entity_id)
         if cal_state is None:
             self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_missing"
         if cal_state.state == "unavailable":
             self.last_calendar_sync_result = "calendar_entity_unavailable"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_unavailable"
 
@@ -1312,6 +1321,8 @@ class AutomowerSupervisorManager:
                 self.last_calendar_sync_result = "error"
                 self.last_calendar_sync_error = str(err)
                 self.last_calendar_sync_at = dt_util.now().isoformat()
+
+                await self._storage.async_save(self.get_storage_data())
                 self._notify_callbacks()
                 return "error"
 
@@ -1323,19 +1334,28 @@ class AutomowerSupervisorManager:
         entity_id = self.calendar_entity_id
         if not entity_id:
             self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_missing"
 
         cal_state = self.hass.states.get(entity_id)
         if cal_state is None:
             self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_missing"
         if cal_state.state == "unavailable":
             self.last_calendar_sync_result = "calendar_entity_unavailable"
+            self.last_calendar_sync_error = None
             self.last_calendar_sync_at = dt_util.now().isoformat()
+
+            await self._storage.async_save(self.get_storage_data())
             self._notify_callbacks()
             return "calendar_entity_unavailable"
 
@@ -1516,6 +1536,8 @@ class AutomowerSupervisorManager:
                 self.last_calendar_sync_result = "error"
                 self.last_calendar_sync_error = str(err)
                 self.last_calendar_sync_at = dt_util.now().isoformat()
+
+                await self._storage.async_save(self.get_storage_data())
                 self._notify_callbacks()
                 return "error"
 
