@@ -112,7 +112,11 @@ class AutomowerRobotSensor(SensorEntity):
         if is_critical:
             return "critical"
 
-        # 2. Warning state due to stale data (takes precedence over insufficient data)
+        # 2. Warning when Charging is reported but battery decreases
+        if state_data.charging_stalled:
+            return "warning"
+
+        # 3. Warning state due to stale data (takes precedence over insufficient data)
         if state_data.online is True and state_data.source_age_minutes is not None and 15 < state_data.source_age_minutes <= 60:
             return "warning"
 
@@ -191,6 +195,9 @@ class AutomowerRobotSensor(SensorEntity):
             reasons.append("BINARY_ERROR_ON")
         if state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
             reasons.append("CLEARED_BUT_UNVERIFIED")
+
+        if state_data.charging_stalled:
+            reasons.append("CHARGING_STALLED")
 
         # Watchdog status reason codes
         if state_data.online is False:
@@ -357,6 +364,13 @@ class AutomowerRobotSensor(SensorEntity):
             "failed_recovery": state_data.failed_recovery,
             "recovery_verified_at": state_data.recovery_verified_at,
             "last_real_error_category": state_data.last_real_error_category,
+            # Charging trend monitoring
+            "charging_started_at": state_data.charging_started_at,
+            "charging_last_sample_at": state_data.charging_last_sample_at,
+            "charging_last_sample_battery": state_data.charging_last_sample_battery,
+            "charging_decline_count": state_data.charging_decline_count,
+            "charging_stalled": state_data.charging_stalled,
+            "charging_stalled_at": state_data.charging_stalled_at,
             # Daily attention
             "daily_attention_required": state_data.daily_attention_required,
             "daily_attention_state": state_data.daily_attention_state,

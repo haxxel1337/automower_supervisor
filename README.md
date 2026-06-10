@@ -1,6 +1,14 @@
-# Automower Supervisor v0.5.3
+# Automower Supervisor v0.5.4
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.4
+
+- **Charging Trend Monitoring**: Uses each mower's `sensor.<robot>_mower_status_plain` Simple Status together with the numeric battery sensor to detect a mower that reports `Charging` while battery percentage decreases.
+- **False-Alarm Protection**: Samples at least 10 minutes apart and requires two decreasing samples before raising `CHARGING_STALLED`.
+- **Automatic Recovery**: Clears the warning when battery percentage rises, charging ends, or battery exceeds 94%.
+- **Options Flow Fix**: Removes the obsolete manual `config_entry` assignment that could cause a 500 error when opening integration settings on newer Home Assistant versions.
+- **Persistent Diagnostics**: Charging-monitor state survives Home Assistant restarts and is exposed as sensor attributes.
 
 ## Improvements in version 0.5.3
 

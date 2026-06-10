@@ -178,7 +178,27 @@ def evaluate_daily_attention(
             text=offline_text,
         )
 
-    # Rule 3: Gating before 11:30
+    # Rule 3: Charging is reported but battery repeatedly decreases
+    if state.charging_stalled:
+        sampled = state.charging_last_sample_battery
+        sampled_text = (
+            f"Senaste batterinivå: {sampled} %."
+            if sampled is not None
+            else "Senaste batterinivå saknas."
+        )
+        text = (
+            f"{display_name}: Roboten står som Charging men batteriet har "
+            f"minskat vid två kontroller med minst 10 minuters mellanrum. "
+            f"{sampled_text} Kontrollera kontakten mot laddstationen."
+        )
+        return DailyAttentionResult(
+            required=True,
+            state="needs_attention",
+            reason_codes=["CHARGING_STALLED"],
+            text=text,
+        )
+
+    # Rule 4: Gating before 11:30
     if not daily_check_started(now):
         # Om session pågår
         if state.mowing_session_active:

@@ -119,6 +119,14 @@ class RobotState:
     recovery_verified_at: str | None = None
     last_real_error_category: str = "none"
 
+    # Charging trend monitoring (Persisted)
+    charging_started_at: str | None = None
+    charging_last_sample_at: str | None = None
+    charging_last_sample_battery: int | None = None
+    charging_decline_count: int = 0
+    charging_stalled: bool = False
+    charging_stalled_at: str | None = None
+
     # Daily state (Persisted)
     daily_date: str | None = None
 

@@ -30,6 +30,7 @@ from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
 from .error_classifier import classify_error
 from .schedule import get_daily_date
+from .charging import update_charging_monitor
 from .activity import (
     safe_float,
     safe_int,
@@ -339,6 +340,13 @@ class AutomowerSupervisorManager:
             state.recovery_distance_baseline = data.get("recovery_distance_baseline")
             state.recovery_accumulated_positive_distance = float(data.get("recovery_accumulated_positive_distance", 0.0))
             state.recovery_previous_distance = data.get("recovery_previous_distance")
+
+            state.charging_started_at = data.get("charging_started_at")
+            state.charging_last_sample_at = data.get("charging_last_sample_at")
+            state.charging_last_sample_battery = data.get("charging_last_sample_battery")
+            state.charging_decline_count = int(data.get("charging_decline_count", 0))
+            state.charging_stalled = bool(data.get("charging_stalled", False))
+            state.charging_stalled_at = data.get("charging_stalled_at")
             
             if "daily_date" in data and data["daily_date"] is not None:
                 state.daily_date = data["daily_date"]
@@ -382,6 +390,12 @@ class AutomowerSupervisorManager:
                 "recovery_distance_baseline": state.recovery_distance_baseline,
                 "recovery_accumulated_positive_distance": state.recovery_accumulated_positive_distance,
                 "recovery_previous_distance": state.recovery_previous_distance,
+                "charging_started_at": state.charging_started_at,
+                "charging_last_sample_at": state.charging_last_sample_at,
+                "charging_last_sample_battery": state.charging_last_sample_battery,
+                "charging_decline_count": state.charging_decline_count,
+                "charging_stalled": state.charging_stalled,
+                "charging_stalled_at": state.charging_stalled_at,
                 "daily_date": state.daily_date,
             }
         data["_metadata"] = {
@@ -432,6 +446,10 @@ class AutomowerSupervisorManager:
                     _update_entity_state_lists(state, entity_id, None)
                     self._update_state_field(state, key, ha_state.state)
                     
+            # Update charging trend after status and battery are loaded
+            if update_charging_monitor(state, now):
+                storage_changed = True
+
             # Evaluate error state after initial loading
             if self._update_robot_error_state(robot_id, current_time_iso):
                 storage_changed = True
@@ -532,6 +550,10 @@ class AutomowerSupervisorManager:
                 
         # Update watchdog metrics in real-time
         self._update_watchdog_for_robot(robot_id, now)
+
+        # Update charging trend after source-state changes
+        if update_charging_monitor(state, now):
+            storage_changed = True
             
         # Re-evaluate logic for errors
         if self._update_robot_error_state(robot_id, current_time_iso):

@@ -4378,12 +4378,45 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Verified by standalone pytest runner.
 
+@pytest.mark.asyncio
+async def test_charging_stalled_detection() -> None:
+    """Two decreasing charging samples must raise CHARGING_STALLED."""
+    import zoneinfo
 
+    from custom_components.automower_supervisor.charging import update_charging_monitor
+    from custom_components.automower_supervisor.daily_assessment import evaluate_daily_attention
+    from custom_components.automower_supervisor.models import RobotState
 
+    state = RobotState(robot_id="test_robot", display_name="Test")
+    state.current_status_plain = "Charging (61 %)"
+    state.current_battery = 61
 
+    tz = zoneinfo.ZoneInfo("Europe/Stockholm")
+    t0 = datetime.datetime(2026, 6, 10, 3, 40, tzinfo=tz)
 
+    assert update_charging_monitor(state, t0) is True
+    assert state.charging_stalled is False
 
+    state.current_battery = 60
+    assert update_charging_monitor(state, t0 + datetime.timedelta(minutes=10)) is True
+    assert state.charging_decline_count == 1
+    assert state.charging_stalled is False
 
+    state.current_battery = 59
+    assert update_charging_monitor(state, t0 + datetime.timedelta(minutes=20)) is True
+    assert state.charging_decline_count == 2
+    assert state.charging_stalled is True
 
+    result = evaluate_daily_attention(state, t0 + datetime.timedelta(minutes=20), observation_complete=True)
+    assert result.required is True
+    assert result.reason_codes == ["CHARGING_STALLED"]
 
+    state.current_battery = 60
+    assert update_charging_monitor(state, t0 + datetime.timedelta(minutes=30)) is True
+    assert state.charging_stalled is False
+    assert state.charging_decline_count == 0
+
+    state.current_status_plain = "Parked"
+    assert update_charging_monitor(state, t0 + datetime.timedelta(minutes=40)) is True
+    assert state.charging_started_at is None
 
