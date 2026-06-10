@@ -578,5 +578,49 @@ class AutomowerSupervisorSummarySensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return details about daily attention states."""
-        return self.manager.daily_attention_summary
+        """Return details about daily attention states and calendar sync."""
+        attrs = dict(self.manager.daily_attention_summary)
+        
+        # Add calendar sync attributes
+        attrs["calendar_sync_enabled"] = self.manager.calendar_enabled
+        attrs["calendar_entity_id"] = self.manager.calendar_entity_id
+        attrs["last_evening_sync_at"] = self.manager.last_evening_sync_at
+        attrs["last_morning_sync_at"] = self.manager.last_morning_sync_at
+        attrs["last_calendar_sync_at"] = self.manager.last_calendar_sync_at
+        attrs["last_calendar_sync_result"] = self.manager.last_calendar_sync_result
+        attrs["last_calendar_sync_error"] = self.manager.last_calendar_sync_error
+        
+        # Snapshot metadata
+        snap = self.manager.calendar_snapshot
+        attrs["evening_snapshot_source_date"] = snap.source_date if snap else None
+        attrs["evening_snapshot_target_date"] = snap.target_calendar_date if snap else None
+        
+        from .const import ROBOTS
+        evening_names = []
+        if snap:
+            for r_id in ROBOTS:
+                for r in snap.robots:
+                    if r.robot_id == r_id:
+                        evening_names.append(r.display_name)
+                        break
+        attrs["evening_snapshot_robot_names"] = evening_names
+        
+        morning_names = []
+        for r_id in ROBOTS:
+            if r_id in self.manager.morning_remaining_robot_ids:
+                morning_names.append(self.manager.robots[r_id].display_name)
+        attrs["morning_remaining_robot_names"] = morning_names
+        
+        cache = self.manager.event_cache
+        attrs["managed_event_date"] = cache.get("date")
+        attrs["managed_event_marker"] = cache.get("marker")
+        attrs["managed_event_uid"] = cache.get("uid")
+        
+        title = None
+        if morning_names:
+            title = "Bot " + ", ".join(morning_names)
+        elif evening_names:
+            title = "Bot " + ", ".join(evening_names)
+        attrs["calendar_event_title"] = title
+        
+        return attrs

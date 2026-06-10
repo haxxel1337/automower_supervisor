@@ -1,6 +1,23 @@
-# Automower Supervisor v0.4.4
+# Automower Supervisor v0.5.0
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.0
+
+- **Calendar Worklist Synchronization**: Introduces automatic calendar worklist sync for mowers needing attention.
+  - **Evening Sync (20:00 Europe/Stockholm)**: Evaluates all mowers, saves a persistent evening snapshot to storage, and creates/replaces a calendar event in the configured calendar entity for the next day at 12:00–12:30 (local time) with a Swedish rule-based description and title listing affected robots (e.g. `Bot Vv18, Bd17, Sbv14`).
+  - **Morning Sync (11:20 Europe/Stockholm)**: Reconciles last night's saved snapshot with current robot states at 11:20:
+    - *Activity problems* (did not start, short attempt, uncertain attempt, etc.) are resolved if the robot is online, error-free, and actively mowing or has confirmed activity today.
+    - *Recovery problems* (active error, cleared but unverified error) require the robot to be fully `recovered` or have confirmed mowing today.
+    - *Offline problems* require the robot to be online, updated within the last 15 minutes, error-free, and actively mowing.
+    - *New Critical issues* arising overnight (new errors, offline states) are added dynamically.
+    - Resolves and removes robots from the title/description, and deletes the calendar event entirely if no robots require attention anymore.
+- **Idempotence & Duplicate Prevention**: Uses a precise description marker line `[AUTOMOWER_SUPERVISOR:v1:YYYY-MM-DD]` to securely find, update, or clean up managed events without affecting user events, even across integration reloads and Home Assistant restarts.
+- **Configurable Options Flow**: Adds options to select the `calendar_entity_id` and configure Evening sync time, Morning sync time, Calendar event start time, and Event duration.
+- **Graceful Disabled Behavior**: If no calendar entity is selected or calendar is disabled, the integration functions normally without throwing warning banners or repair issues.
+- **Manual Services**: Registers `automower_supervisor.sync_calendar` (accepting `auto`, `evening`, or `morning` mode) and `automower_supervisor.delete_managed_calendar_event` for manual reconciliation and debugging.
+- **Downtime Catch-up**: Performs startup checks to run missed morning syncs (cutoff: 12:00) or evening syncs (cutoff: midnight) if Home Assistant was offline during the scheduled trigger times.
+- **Deterministic Svenska Text Mallar**: Utilizes pure rule-based, deterministic Swedish text formatting. No external LLMs, OAuth, or direct Google Calendar APIs are used (all calls go through Home Assistant's standard calendar services and component layer).
 
 ## Improvements in version 0.4.4
 

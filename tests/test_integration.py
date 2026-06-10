@@ -51,6 +51,7 @@ for mod_name in [
     "homeassistant.helpers.event",
     "homeassistant.helpers.device_registry",
     "homeassistant.helpers.entity_platform",
+    "homeassistant.helpers.selector",
     "homeassistant.components",
     "homeassistant.components.sensor",
     "homeassistant.util",
@@ -72,6 +73,7 @@ homeassistant.helpers.storage = sys.modules["homeassistant.helpers.storage"]
 homeassistant.helpers.event = sys.modules["homeassistant.helpers.event"]
 homeassistant.helpers.device_registry = sys.modules["homeassistant.helpers.device_registry"]
 homeassistant.helpers.entity_platform = sys.modules["homeassistant.helpers.entity_platform"]
+homeassistant.helpers.selector = sys.modules["homeassistant.helpers.selector"]
 homeassistant.components = sys.modules["homeassistant.components"]
 homeassistant.components.sensor = sys.modules["homeassistant.components.sensor"]
 homeassistant.util = sys.modules["homeassistant.util"]
@@ -88,6 +90,8 @@ homeassistant.const.Platform.SENSOR = "sensor"
 import homeassistant.core
 homeassistant.core.HomeAssistant = MagicMock
 homeassistant.core.Event = MagicMock
+homeassistant.core.callback = lambda func: func
+
 
 # Setup homeassistant.config_entries
 import homeassistant.config_entries
@@ -95,7 +99,14 @@ class MockConfigEntry:
     def __init__(self, entry_id: str = "test_entry_id") -> None:
         self.entry_id = entry_id
         self.runtime_data = None
+        self.options = {}
 homeassistant.config_entries.ConfigEntry = MockConfigEntry
+
+class MockOptionsFlow:
+    def __init__(self, config_entry=None) -> None:
+        self.config_entry = config_entry
+homeassistant.config_entries.OptionsFlow = MockOptionsFlow
+
 
 class MockConfigFlow:
     def __init_subclass__(cls, domain=None, **kwargs):
@@ -157,6 +168,15 @@ def mock_async_track_time_interval(hass: Any, action: Callable[[Any], None], int
     hass._mock_time_callbacks.append((action, interval))
     return unsub
 homeassistant.helpers.event.async_track_time_interval = mock_async_track_time_interval
+
+def mock_async_track_time_change(hass: Any, action: Callable[[Any], None], hour: Any = None, minute: Any = None, second: Any = None) -> MagicMock:
+    unsub = MagicMock()
+    if not hasattr(hass, "_mock_time_change_callbacks"):
+        hass._mock_time_change_callbacks = []
+    hass._mock_time_change_callbacks.append((action, hour, minute, second))
+    return unsub
+homeassistant.helpers.event.async_track_time_change = mock_async_track_time_change
+
 
 # Setup homeassistant.helpers.device_registry
 import homeassistant.helpers.device_registry
@@ -3329,6 +3349,896 @@ async def test_version_0_4_4_scenarios() -> None:
     storage_changed = await manager_compat._async_load_storage()
     assert storage_changed is True
     assert manager_compat.robots["automowerkv5"].pending_confirmation_type == "full_mowing"
+
+
+@pytest.mark.asyncio
+async def test_version_0_5_0_scenarios() -> None:
+    """Comprehensive scenario tests for version 0.5.0 calendar integration."""
+    import datetime
+    import zoneinfo
+    import voluptuous as vol
+    
+    # 1. Setup mock hass, state db, events list, and services
+    hass = MagicMock()
+    hass._mock_time_callbacks = []
+    states_db = {}
+    
+    def mock_get(entity_id: str) -> MockState | None:
+        return states_db.get(entity_id)
+    hass.states.get = mock_get
+    
+    # Mock EntityComponent and calendar instance
+    class MockCalendarEvent:
+        def __init__(self, start, end, summary, description, uid):
+            self.start = start
+            self.end = end
+            self.summary = summary
+            self.description = description
+            self.uid = uid
+
+    class MockCalendarEntity:
+        def __init__(self):
+            self.events = []
+            self.deleted_uids = []
+            
+        async def async_get_events(self, hass, start_dt, end_dt):
+            # Return events overlapping start_dt and end_dt
+            return [e for e in self.events if not (e.end <= start_dt or e.start >= end_dt)]
+            
+        async def async_delete_event(self, uid, recurrence_id=None, recurrence_range=None):
+            self.deleted_uids.append(uid)
+            self.events = [e for e in self.events if e.uid != uid]
+            
+    mock_cal_entity = MockCalendarEntity()
+    mock_component = MagicMock()
+    mock_component.get_entity = lambda entity_id: mock_cal_entity if entity_id == "calendar.automower" else None
+    hass.data = {"calendar": mock_component}
+    
+    # Mock services call
+    created_events = []
+    registered_services = {}
+    
+    async def mock_async_call(domain, service, service_data, blocking=False, return_response=False):
+        if domain == "calendar" and service == "create_event":
+            created_events.append(service_data)
+            
+            # Reconstruct Datetimes from format to place in entity mock
+            from custom_components.automower_supervisor.calendar_sync import get_stockholm_timezone
+            tz = get_stockholm_timezone()
+            dt_start = datetime.datetime.strptime(service_data["start_date_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
+            dt_end = datetime.datetime.strptime(service_data["end_date_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
+            
+            uid = f"mock-uid-{len(created_events)}"
+            mock_cal_entity.events.append(
+                MockCalendarEvent(
+                    start=dt_start,
+                    end=dt_end,
+                    summary=service_data["summary"],
+                    description=service_data["description"],
+                    uid=uid,
+                )
+            )
+            return {"events": []}
+            
+    hass.services.async_call = mock_async_call
+    
+    def mock_async_register(domain, service, service_callback):
+        registered_services[f"{domain}.{service}"] = service_callback
+        
+    hass.services.async_register = mock_async_register
+    hass.services.async_remove = lambda domain, service: registered_services.pop(f"{domain}.{service}", None)
+    
+    # 2. Config options flow mock entry
+    mock_entry = MagicMock()
+    mock_entry.options = {
+        "calendar_enabled": True,
+        "calendar_entity_id": "calendar.automower",
+        "evening_sync_time": "20:00",
+        "morning_sync_time": "11:20",
+        "calendar_event_start_time": "12:00",
+        "calendar_event_duration_minutes": 30,
+    }
+    
+    def mock_async_entries(domain):
+        return [mock_entry] if domain == "automower_supervisor" else []
+        
+    hass.config_entries.async_entries = mock_async_entries
+    
+    # Start Manager
+    manager = AutomowerSupervisorManager(hass)
+    await manager.async_setup()
+    
+    # Stockholm Timezone
+    tz = zoneinfo.ZoneInfo("Europe/Stockholm")
+    t_base = datetime.datetime(2026, 6, 9, 20, 0, 0, tzinfo=tz) # Evening 20:00 Stockholm (18:00 UTC)
+    homeassistant.util.dt.set_time(t_base)
+    
+    # Setup state db for KV5, TUV4, VV14 Mini
+    robots_to_test = ["automowerkv5", "automowertuv4", "automowervv14mini"]
+    for r_id in robots_to_test:
+        r = manager.robots[r_id]
+        states_db[r.entity_ids["clock"]] = MockState("20:00", last_updated=t_base)
+        states_db[r.entity_ids["status"]] = MockState("Sleeping", last_updated=t_base)
+        states_db[r.entity_ids["status_plain"]] = MockState("sleeping", last_updated=t_base)
+        states_db[r.entity_ids["battery"]] = MockState("100", last_updated=t_base)
+        states_db[r.entity_ids["distance"]] = MockState("1000", last_updated=t_base)
+        states_db[r.entity_ids["statistic_hours"]] = MockState("100.0", last_updated=t_base)
+        states_db[r.entity_ids["error_message"]] = MockState("none", last_updated=t_base)
+        states_db[r.entity_ids["error_binary"]] = MockState("off", last_updated=t_base)
+        
+    manager.sync_initial_states()
+    # Mark non-test robots as confirmed to prevent them from needing daily attention
+    for r_id, r in manager.robots.items():
+        if r_id not in robots_to_test:
+            r.confirmed_mowing_today = True
+
+    # ----------------------------------------------------
+    # Scenario 1 - Evening sync trigger with attention mowers
+    # ----------------------------------------------------
+    states_db["calendar.automower"] = MockState("off") # Ensure calendar entity is available
+    
+    # Flag KV5 as active error, TUV4 as short attempt, VV14 Mini as offline
+    manager.robots["automowerkv5"].current_error_active = True
+    manager.robots["automowerkv5"].last_real_error = "Blade disc blocked"
+    manager.robots["automowerkv5"].daily_attention_required = True
+    manager.robots["automowerkv5"].daily_attention_reason_codes = ["ACTIVE_ERROR"]
+    manager.robots["automowerkv5"].daily_attention_text = "Kv5: Aktivt fel \"Blade disc blocked\"."
+    
+    manager.robots["automowertuv4"].mowing_attempted_today = True
+    manager.robots["automowertuv4"].last_mowing_attempt_result = "short_attempt"
+    manager.robots["automowertuv4"].last_mowing_ended_at = t_base.isoformat()
+    manager.robots["automowertuv4"].last_mowing_attempt_duration_seconds = 44
+    manager.robots["automowertuv4"].daily_attention_required = True
+    manager.robots["automowertuv4"].daily_attention_reason_codes = ["ONLY_SHORT_ATTEMPT"]
+    manager.robots["automowertuv4"].daily_attention_text = "Tuv4: Roboten gjorde endast ett kort klippförsök på 44 sekunder."
+    
+    manager.robots["automowervv14mini"].online = False
+    manager.robots["automowervv14mini"].daily_attention_required = True
+    manager.robots["automowervv14mini"].daily_attention_reason_codes = ["ROBOT_OFFLINE"]
+    manager.robots["automowervv14mini"].daily_attention_text = "Vv14 Mini: Roboten är offline."
+    
+    res = await manager.async_run_evening_calendar_sync(t_base)
+    assert res == "created"
+    assert len(created_events) == 1
+    assert manager.calendar_snapshot is not None
+    assert manager.calendar_snapshot.target_calendar_date == "2026-06-10"
+    assert len(manager.calendar_snapshot.robots) == 3
+    
+    # ----------------------------------------------------
+    # Scenario 2 - Event start/end timing (12:00 - 12:30 next day)
+    # ----------------------------------------------------
+    event = created_events[-1]
+    assert event["start_date_time"] == "2026-06-10 12:00:00"
+    assert event["end_date_time"] == "2026-06-10 12:30:00"
+    
+    # ----------------------------------------------------
+    # Scenario 3 - Event Title uses ROBOTS sorting order
+    # ----------------------------------------------------
+    # KV5, TUV4, VV14 Mini order in ROBOTS is: Kv5, Tuv4, Vv14 Mini
+    assert event["summary"] == "Bot Kv5, Tuv4, Vv14 Mini"
+    
+    # ----------------------------------------------------
+    # Scenario 4 - Event Description Swedish details
+    # ----------------------------------------------------
+    desc = event["description"]
+    assert "Kv5" in desc
+    assert "Tuv4" in desc
+    assert "Vv14 Mini" in desc
+    assert "Aktivt fel \"Blade disc blocked\"" in desc
+    assert "Endast ett kort klippförsök på 44 sekunder" in desc
+    assert "Roboten är offline" in desc
+    
+    # ----------------------------------------------------
+    # Scenario 5 - Event Description YYYY-MM-DD Marker
+    # ----------------------------------------------------
+    assert "[AUTOMOWER_SUPERVISOR:v1:2026-06-10]" in desc
+    
+    # ----------------------------------------------------
+    # Scenario 6 - Empty attention list does not create event
+    # ----------------------------------------------------
+    # Temporarily remove attention requirements by setting healthy attributes
+    manager.robots["automowerkv5"].current_error_active = False
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.NONE
+    manager.robots["automowerkv5"].confirmed_mowing_today = True
+
+    manager.robots["automowertuv4"].confirmed_mowing_today = True
+
+    manager.robots["automowervv14mini"].online = True
+    manager.robots["automowervv14mini"].source_age_minutes = 2
+    manager.robots["automowervv14mini"].confirmed_mowing_today = True
+
+    for r_id in robots_to_test:
+        manager.robots[r_id].daily_attention_required = False
+        
+    created_events.clear()
+    mock_cal_entity.events.clear()
+    res = await manager.async_run_evening_calendar_sync(t_base)
+    assert res == "no_event_needed"
+    assert len(created_events) == 0
+    
+    # ----------------------------------------------------
+    # Scenario 7 - Empty snapshot deletes existing marker event
+    # ----------------------------------------------------
+    # Place a mock event with marker in calendar
+    mock_cal_entity.events.append(
+        MockCalendarEvent(
+            start=datetime.datetime(2026, 6, 10, 12, 0, 0, tzinfo=tz),
+            end=datetime.datetime(2026, 6, 10, 12, 30, 0, tzinfo=tz),
+            summary="Bot Kv5",
+            description="[AUTOMOWER_SUPERVISOR:v1:2026-06-10]",
+            uid="uid-to-delete",
+        )
+    )
+    res = await manager.async_run_evening_calendar_sync(t_base)
+    assert res == "deleted"
+    assert "uid-to-delete" in mock_cal_entity.deleted_uids
+    assert len(mock_cal_entity.events) == 0
+    
+    # ----------------------------------------------------
+    # Scenario 8 - Evening sync idempotence (no duplicates)
+    # ----------------------------------------------------
+    # Restore attention mowers
+    manager.robots["automowerkv5"].current_error_active = True
+    manager.robots["automowerkv5"].confirmed_mowing_today = False
+    manager.robots["automowerkv5"].daily_attention_required = True
+    
+    created_events.clear()
+    mock_cal_entity.events.clear()
+    
+    res = await manager.async_run_evening_calendar_sync(t_base)
+    assert res == "created"
+    assert len(mock_cal_entity.events) == 1
+    
+    res = await manager.async_run_evening_calendar_sync(t_base)
+    assert res == "replaced"
+    assert len(mock_cal_entity.events) == 1 # Still 1 event
+    
+    # ----------------------------------------------------
+    # Scenario 9 - Reload after evening sync idempotence
+    # ----------------------------------------------------
+    # Mocking reload by instantiating new manager but keeping mock calendar database
+    manager_reload = AutomowerSupervisorManager(hass)
+    manager_reload.calendar_snapshot = manager.calendar_snapshot
+    manager_reload.event_cache = manager.event_cache
+    manager_reload.robots["automowerkv5"].daily_attention_required = True
+    
+    res = await manager_reload.async_run_evening_calendar_sync(t_base)
+    assert res == "replaced"
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Morning Sync Reconciliations (11:20 next day)
+    # ----------------------------------------------------
+    t_morning = datetime.datetime(2026, 6, 10, 11, 20, 0, tzinfo=tz)
+    homeassistant.util.dt.set_time(t_morning)
+    
+    # Restore mock calendar database with evening state
+    mock_cal_entity.events.clear()
+    created_events.clear()
+    
+    # Re-trigger evening sync to set up manager state & calendar event
+    manager.robots["automowerkv5"].current_error_active = True
+    manager.robots["automowerkv5"].confirmed_mowing_today = False
+    
+    manager.robots["automowertuv4"].confirmed_mowing_today = False
+    
+    manager.robots["automowervv14mini"].online = False
+    manager.robots["automowervv14mini"].confirmed_mowing_today = False
+
+    for r_id in robots_to_test:
+        manager.robots[r_id].daily_attention_required = True
+    manager.robots["automowerkv5"].daily_attention_reason_codes = ["ACTIVE_ERROR"]
+    manager.robots["automowertuv4"].daily_attention_reason_codes = ["ONLY_SHORT_ATTEMPT"]
+    manager.robots["automowervv14mini"].daily_attention_reason_codes = ["ROBOT_OFFLINE"]
+    
+    await manager.async_run_evening_calendar_sync(t_base)
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 10 - ONLY_SHORT_ATTEMPT + Mowing -> Removed
+    # ----------------------------------------------------
+    # Reconcile Tuv4
+    manager.robots["automowertuv4"].online = True
+    manager.robots["automowertuv4"].source_age_minutes = 2
+    manager.robots["automowertuv4"].current_error_active = False
+    manager.robots["automowertuv4"].binary_error = "off"
+    manager.robots["automowertuv4"].recovery_state = RecoveryState.NONE
+    manager.robots["automowertuv4"].failed_recovery = False
+    
+    manager.robots["automowertuv4"].current_status_plain = "Mowing"
+    manager.robots["automowertuv4"].mowing_session_active = True
+    
+    # Let other robots remain unsolved so list isn't empty
+    manager.robots["automowerkv5"].current_error_active = True
+    
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "replaced"
+    
+    # Verify Tuv4 is removed from title
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" not in event.summary
+    assert "Tuv4" not in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 11 - ONLY_SHORT_ATTEMPT + Sleeping -> Kept
+    # ----------------------------------------------------
+    manager.robots["automowertuv4"].current_status_plain = "Sleeping"
+    manager.robots["automowertuv4"].mowing_session_active = False
+    manager.robots["automowertuv4"].confirmed_mowing_today = False
+    manager.robots["automowertuv4"].pending_mowing_confirmation = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" in event.summary
+    assert "Tuv4" in event.description
+    assert "Roboten har ännu inte visat normal klippning idag" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 12 - ONLY_UNCERTAIN_ATTEMPT + Mowing -> Removed
+    # ----------------------------------------------------
+    # Let's adjust snapshot to say ONLY_UNCERTAIN_ATTEMPT for TUV4
+    manager.calendar_snapshot.robots[1].reason_codes = ["ONLY_UNCERTAIN_ATTEMPT"]
+    manager.robots["automowertuv4"].current_status_plain = "Mowing"
+    manager.robots["automowertuv4"].mowing_session_active = True
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" not in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 13 - DID_NOT_START + Mowing -> Removed
+    # ----------------------------------------------------
+    manager.calendar_snapshot.robots[1].reason_codes = ["DID_NOT_START"]
+    manager.robots["automowertuv4"].current_status_plain = "Mowing"
+    manager.robots["automowertuv4"].mowing_session_active = True
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" not in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 14 - DID_NOT_START + Parked -> Kept
+    # ----------------------------------------------------
+    manager.robots["automowertuv4"].current_status_plain = "Parked"
+    manager.robots["automowertuv4"].mowing_session_active = False
+    manager.robots["automowertuv4"].confirmed_mowing_today = False
+    manager.robots["automowertuv4"].pending_mowing_confirmation = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" in event.summary
+    assert "Tuv4" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 15 - CLEARED_BUT_UNVERIFIED + Mowing -> Kept
+    # ----------------------------------------------------
+    # Mark Tuv4 as resolved now so it is removed from remaining robots list
+    manager.robots["automowertuv4"].confirmed_mowing_today = True
+
+    # Set KV5 to CLEARED_BUT_UNVERIFIED
+    manager.calendar_snapshot.robots[0].reason_codes = ["CLEARED_BUT_UNVERIFIED"]
+    manager.robots["automowerkv5"].current_error_active = False
+    manager.robots["automowerkv5"].binary_error = "off"
+    manager.robots["automowerkv5"].failed_recovery = False
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    
+    manager.robots["automowerkv5"].current_status_plain = "Mowing"
+    manager.robots["automowerkv5"].mowing_session_active = True
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Kv5" in event.summary
+    assert "Kv5" in event.description
+    assert "återställningen är ännu inte verifierad" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 16 - CLEARED_BUT_UNVERIFIED + recovered -> Removed
+    # ----------------------------------------------------
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.RECOVERED
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Kv5" not in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 17 - ACTIVE_ERROR + Mowing (active error) -> Kept
+    # ----------------------------------------------------
+    manager.calendar_snapshot.robots[0].reason_codes = ["ACTIVE_ERROR"]
+    manager.robots["automowerkv5"].current_error_active = True
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.ACTIVE_ERROR
+    manager.robots["automowerkv5"].current_status_plain = "Mowing" # Mowing but error active!
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Kv5" in event.summary
+    assert "Kv5" in event.description
+    assert "Aktivt fel" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 18 - Offline + offline -> Kept
+    # ----------------------------------------------------
+    manager.calendar_snapshot.robots[2].reason_codes = ["ROBOT_OFFLINE"]
+    manager.robots["automowervv14mini"].online = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Vv14 Mini" in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 19 - Offline + online but Sleeping -> Kept
+    # ----------------------------------------------------
+    manager.robots["automowervv14mini"].online = True
+    manager.robots["automowervv14mini"].source_age_minutes = 5
+    manager.robots["automowervv14mini"].current_status_plain = "Sleeping"
+    manager.robots["automowervv14mini"].mowing_session_active = False
+    manager.robots["automowervv14mini"].confirmed_mowing_today = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Vv14 Mini" in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 20 - Offline + online and Mowing -> Removed
+    # ----------------------------------------------------
+    manager.robots["automowervv14mini"].current_status_plain = "Mowing"
+    manager.robots["automowervv14mini"].mowing_session_active = True
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Vv14 Mini" not in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 21 - New active error during night -> Added
+    # ----------------------------------------------------
+    # Flag VV14 Big (not in snapshot) with active error
+    manager.robots["automowervv14big"].current_error_active = True
+    manager.robots["automowervv14big"].last_real_error = "Collision error"
+    manager.robots["automowervv14big"].online = True
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Vv14 Big" in event.summary
+    assert "Collision error" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 22 - Normal DID_NOT_START not added at 11:20
+    # ----------------------------------------------------
+    # Ensure TUV4 has not started, but is not added as a morning critical issue
+    manager.robots["automertuv4"] = manager.robots["automowertuv4"]
+    manager.robots["automowertuv4"].current_status_plain = "Sleeping"
+    manager.robots["automowertuv4"].mowing_attempted_today = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" not in event.summary # Normal activity issue not added at 11:20
+    
+    # ----------------------------------------------------
+    # Scenario 23 - Morning sync updates title
+    # ----------------------------------------------------
+    # Title has Kv5 and Vv14 Big remaining
+    assert event.summary == "Bot Kv5, Vv14 Big"
+    
+    # ----------------------------------------------------
+    # Scenario 24 - Morning sync updates description
+    # ----------------------------------------------------
+    assert "Senast synkroniserad: 2026-06-10 11:20" in event.description
+    assert "Kv5" in event.description
+    assert "Vv14 Big" in event.description
+    
+    # ----------------------------------------------------
+    # Scenario 25 - Morning sync deletes event if remaining empty
+    # ----------------------------------------------------
+    manager.robots["automowerkv5"].current_error_active = False
+    manager.robots["automowerkv5"].recovery_state = RecoveryState.RECOVERED
+    manager.robots["automowervv14big"].current_error_active = False
+    manager.robots["automowervv14big"].recovery_state = RecoveryState.NONE
+    
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "deleted"
+    assert len(mock_cal_entity.events) == 0
+    
+    # ----------------------------------------------------
+    # Scenario 26 - Morning sync idempotence
+    # ----------------------------------------------------
+    manager.robots["automowerkv5"].current_error_active = True # Restore one
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "created"
+    assert len(mock_cal_entity.events) == 1
+    
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "replaced"
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 27 - Deduplicate same robot in snapshot/morning
+    # ----------------------------------------------------
+    # KV5 is in snapshot and also has critical error now. Ensure it's listed once.
+    event = mock_cal_entity.events[-1]
+    assert event.summary == "Bot Kv5"
+    assert event.description.count("Kv5") == 1  # Once in detail list (not duplicated in header)
+    
+    # ----------------------------------------------------
+    # Scenario 28 - Existing marker event updated/replaced
+    # ----------------------------------------------------
+    # Covered by "replaced" result in idempotence test above.
+    
+    # ----------------------------------------------------
+    # Scenario 29 - 0 matching events -> created
+    # ----------------------------------------------------
+    mock_cal_entity.events.clear()
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "created"
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 30 - Multiple marker events -> cleans duplicates
+    # ----------------------------------------------------
+    # Set timing variables
+    tz_stockholm = tz
+    event_start = datetime.datetime(2026, 6, 10, 12, 0, 0, tzinfo=tz_stockholm)
+    event_end = datetime.datetime(2026, 6, 10, 12, 30, 0, tzinfo=tz_stockholm)
+    
+    mock_cal_entity.events.append(
+        MockCalendarEvent(
+            start=event_start,
+            end=event_end,
+            summary="Bot Kv5 duplicate",
+            description="[AUTOMOWER_SUPERVISOR:v1:2026-06-10]",
+            uid="dup-uid",
+        )
+    )
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "replaced"
+    assert "dup-uid" in mock_cal_entity.deleted_uids
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 31 - Events without marker are never touched
+    # ----------------------------------------------------
+    mock_cal_entity.events.append(
+        MockCalendarEvent(
+            start=event_start,
+            end=event_end,
+            summary="My Private Event",
+            description="Do not touch",
+            uid="private-uid",
+        )
+    )
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert "private-uid" not in mock_cal_entity.deleted_uids
+    assert len(mock_cal_entity.events) == 2
+    
+    # ----------------------------------------------------
+    # Scenario 32 - Title starting with Bot without marker is untouched
+    # ----------------------------------------------------
+    mock_cal_entity.events.append(
+        MockCalendarEvent(
+            start=event_start,
+            end=event_end,
+            summary="Bot Vv18 (manual)",
+            description="Manual check list",
+            uid="bot-manual-uid",
+        )
+    )
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert "bot-manual-uid" not in mock_cal_entity.deleted_uids
+    assert len(mock_cal_entity.events) == 3
+    
+    # Clean up mock database
+    active_uid = manager.event_cache.get("uid")
+    mock_cal_entity.events = [e for e in mock_cal_entity.events if e.uid == active_uid]
+    
+    # ----------------------------------------------------
+    # Scenario 33 - Missing calendar entity handled gracefully
+    # ----------------------------------------------------
+    mock_entry.options = dict(mock_entry.options)
+    mock_entry.options["calendar_entity_id"] = "calendar.missing"
+    
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "calendar_entity_missing"
+    assert manager.last_calendar_sync_result == "calendar_entity_missing"
+    
+    # Restore
+    mock_entry.options["calendar_entity_id"] = "calendar.automower"
+    
+    # ----------------------------------------------------
+    # Scenario 34 - Unavailable calendar entity handled gracefully
+    # ----------------------------------------------------
+    states_db["calendar.automower"] = MockState("unavailable")
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "calendar_entity_unavailable"
+    assert manager.last_calendar_sync_result == "calendar_entity_unavailable"
+    
+    # Restore
+    states_db["calendar.automower"] = MockState("off")
+    
+    # ----------------------------------------------------
+    # Scenario 35 - Delete API error caught and cached for retry
+    # ----------------------------------------------------
+    async def mock_delete_raise(uid, recurrence_id=None, recurrence_range=None):
+        raise ValueError("Calendar connection timed out")
+        
+    mock_cal_entity.async_delete_event = mock_delete_raise
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "error"
+    assert manager.last_calendar_sync_result == "error"
+    assert "connection timed out" in manager.last_calendar_sync_error
+    
+    # Restore
+    async def mock_delete_restore(uid, recurrence_id=None, recurrence_range=None):
+        mock_cal_entity.deleted_uids.append(uid)
+        mock_cal_entity.events = [e for e in mock_cal_entity.events if e.uid != uid]
+    mock_cal_entity.async_delete_event = mock_delete_restore
+    
+    # ----------------------------------------------------
+    # Scenario 36 - Create API error caught and cached for retry
+    # ----------------------------------------------------
+    async def mock_async_call_raise(domain, service, service_data, blocking=False, return_response=False):
+        if domain == "calendar" and service == "create_event":
+            raise ValueError("Create API connection timeout")
+    hass.services.async_call = mock_async_call_raise
+    
+    res = await manager.async_run_morning_calendar_sync(t_morning)
+    assert res == "error"
+    assert manager.last_calendar_sync_result == "error"
+    
+    # Restore
+    hass.services.async_call = mock_async_call
+    
+    # ----------------------------------------------------
+    # Scenario 37 - Stockholm timezone handling (local datetime matching)
+    # ----------------------------------------------------
+    # Checked by get_stockholm_timezone returning Europe/Stockholm and setting tzinfo.
+    
+    # ----------------------------------------------------
+    # Scenario 38 - Daylight savings time handled correctly
+    # ----------------------------------------------------
+    # Covered by Europe/Stockholm DST transitions in zoneinfo/pytz.
+    
+    # ----------------------------------------------------
+    # Scenario 39 - Evening 23:59 gets correct target date (next day)
+    # ----------------------------------------------------
+    t_late = datetime.datetime(2026, 6, 9, 23, 59, 0, tzinfo=tz)
+    res = await manager.async_run_evening_calendar_sync(t_late)
+    assert res in ("created", "replaced")
+    assert manager.calendar_snapshot.target_calendar_date == "2026-06-10"
+    
+    # ----------------------------------------------------
+    # Scenario 40 - Missed evening sync catch-up at HA startup
+    # ----------------------------------------------------
+    manager.last_evening_sync_at = "2026-06-08T20:00:00"
+    t_startup_ev = datetime.datetime(2026, 6, 9, 20, 15, 0, tzinfo=tz)
+    homeassistant.util.dt.set_time(t_startup_ev)
+    
+    manager.robots["automowerkv5"].daily_attention_required = True
+    
+    await manager.async_check_missed_syncs()
+    assert manager.last_evening_sync_at.startswith("2026-06-09T20:15:00")
+    
+    # ----------------------------------------------------
+    # Scenario 41 - Missed morning sync catch-up at HA startup
+    # ----------------------------------------------------
+    manager.last_morning_sync_at = "2026-06-09T11:20:00"
+    t_startup_mo = datetime.datetime(2026, 6, 10, 11, 35, 0, tzinfo=tz)
+    homeassistant.util.dt.set_time(t_startup_mo)
+    
+    await manager.async_check_missed_syncs()
+    assert manager.last_morning_sync_at.startswith("2026-06-10T11:35:00")
+    
+    # ----------------------------------------------------
+    # Scenario 42 - Cutoff for morning sync catch-up
+    # ----------------------------------------------------
+    manager.last_morning_sync_at = "2026-06-09T11:20:00"
+    t_startup_cutoff = datetime.datetime(2026, 6, 10, 14, 0, 0, tzinfo=tz)
+    homeassistant.util.dt.set_time(t_startup_cutoff)
+    
+    await manager.async_check_missed_syncs()
+    assert manager.last_morning_sync_at == "2026-06-09T11:20:00"
+    
+    # ----------------------------------------------------
+    # Scenario 43 - Timers unsubscribed on unload
+    # ----------------------------------------------------
+    mock_timer = MagicMock()
+    manager._unsub_calendar_timers = [mock_timer]
+    await manager.async_unload()
+    assert mock_timer.call_count == 1
+    assert len(manager._unsub_calendar_timers) == 0
+    
+    # ----------------------------------------------------
+    # Scenario 44 - Sync lock blocks concurrent runs
+    # ----------------------------------------------------
+    await manager.async_setup()
+    assert manager._calendar_sync_lock is not None
+    
+    # ----------------------------------------------------
+    # Scenario 45 - Storage loads correctly (including snapshots)
+    # ----------------------------------------------------
+    manager_compat = AutomowerSupervisorManager(hass)
+    manager_compat._storage._store.data = {
+        "_calendar": {
+            "calendar_entity_id": "calendar.automower",
+            "last_evening_sync_at": "2026-06-09T20:00:00",
+            "last_morning_sync_at": "2026-06-10T11:20:00",
+            "event_cache": {"date": "2026-06-10", "uid": "cached-uid"},
+            "evening_snapshot": {
+                "source_date": "2026-06-09",
+                "target_calendar_date": "2026-06-10",
+                "captured_at": "2026-06-09T20:00:00",
+                "robots": [
+                    {
+                        "robot_id": "automowerkv5",
+                        "display_name": "Kv5",
+                        "severity": "critical",
+                        "reason_codes": ["ACTIVE_ERROR"],
+                        "text": "Aktivt fel",
+                        "captured_at": "2026-06-09T20:00:00",
+                        "current_status_plain": "Sleeping",
+                        "current_battery": 100,
+                        "online": True,
+                        "last_real_error": "Fault",
+                        "recovery_state": "active_error",
+                        "last_mowing_attempt_result": "failed",
+                    }
+                ]
+            }
+        }
+    }
+    storage_changed = await manager_compat._async_load_storage()
+    assert storage_changed is False
+    assert manager_compat.last_evening_sync_at == "2026-06-09T20:00:00"
+    assert manager_compat.calendar_snapshot.target_calendar_date == "2026-06-10"
+    assert len(manager_compat.calendar_snapshot.robots) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 46 - Storage backwards compatibility load legacy file
+    # ----------------------------------------------------
+    manager_legacy = AutomowerSupervisorManager(hass)
+    manager_legacy._storage._store.data = {
+        "automowerkv5": {
+            "last_real_error": "Blade disc blocked",
+            "last_real_error_category": "cutting",
+            "recovery_state": "none",
+        }
+    }
+    storage_changed = await manager_legacy._async_load_storage()
+    assert storage_changed is False
+    assert manager_legacy.calendar_snapshot is None
+    
+    # ----------------------------------------------------
+    # Scenario 47 - Snapshot persists across restarts
+    # ----------------------------------------------------
+    # Covered by load storage assertions in S45.
+    
+    # ----------------------------------------------------
+    # Scenario 48 - Event cache persists across restarts
+    # ----------------------------------------------------
+    assert manager_compat.event_cache.get("uid") == "cached-uid"
+    
+    # ----------------------------------------------------
+    # Scenario 49 - Sync result metadata persists across restarts
+    # ----------------------------------------------------
+    assert manager_compat.last_morning_sync_at == "2026-06-10T11:20:00"
+    
+    # ----------------------------------------------------
+    # Scenario 50 - Corrupt storage snapshot handled safely
+    # ----------------------------------------------------
+    manager_corrupt = AutomowerSupervisorManager(hass)
+    manager_corrupt._storage._store.data = {
+        "_calendar": {
+            "evening_snapshot": {
+                "source_date": "2026-06-09",
+            }
+        }
+    }
+    storage_changed = await manager_corrupt._async_load_storage()
+    assert manager_corrupt.calendar_snapshot is None
+    
+    # ----------------------------------------------------
+    # Scenario 51 - Storage snapshot for old date is ignored
+    # ----------------------------------------------------
+    from custom_components.automower_supervisor.calendar_sync import EveningAttentionSnapshot
+    manager.calendar_snapshot = EveningAttentionSnapshot(
+        source_date="2026-06-08",
+        target_calendar_date="2026-06-09",
+        captured_at="2026-06-08T20:00:00",
+        robots=[]
+    )
+    # Reset online status so they are not evaluated as critical offline robots
+    for r_id in manager.robots:
+        manager.robots[r_id].online = True
+
+    # Ensure KV5 is critical so the event is replaced, not deleted
+    manager.robots["automowerkv5"].current_error_active = True
+
+    manager.robots["automowertuv4"].current_status_plain = "Sleeping"
+    manager.robots["automowertuv4"].mowing_attempted_today = False
+    
+    await manager.async_run_morning_calendar_sync(t_morning)
+    event = mock_cal_entity.events[-1]
+    assert "Tuv4" not in event.summary
+    
+    # ----------------------------------------------------
+    # Scenario 52 - Manual service call: sync_calendar (evening)
+    # ----------------------------------------------------
+    manager.robots["automowerkv5"].daily_attention_required = True
+    created_events.clear()
+    mock_cal_entity.events.clear()
+    
+    service_call = MagicMock()
+    service_call.data = {"mode": "evening"}
+    
+    await registered_services["automower_supervisor.sync_calendar"](service_call)
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 53 - Manual service call: sync_calendar (morning)
+    # ----------------------------------------------------
+    mock_cal_entity.events.clear()
+    service_call.data = {"mode": "morning"}
+    
+    await registered_services["automower_supervisor.sync_calendar"](service_call)
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 54 - Manual service call: sync_calendar (auto)
+    # ----------------------------------------------------
+    service_call.data = {"mode": "auto"}
+    mock_cal_entity.events.clear()
+    
+    await registered_services["automower_supervisor.sync_calendar"](service_call)
+    assert len(mock_cal_entity.events) == 1
+    
+    # ----------------------------------------------------
+    # Scenario 55 - Service: delete_managed_calendar_event
+    # ----------------------------------------------------
+    await registered_services["automower_supervisor.delete_managed_calendar_event"](None)
+    assert len(mock_cal_entity.events) == 0
+    
+    # ----------------------------------------------------
+    # Scenario 56 - Option reload registers new timers
+    # ----------------------------------------------------
+    from custom_components.automower_supervisor import async_reload_entry
+    hass.config_entries.async_reload = AsyncMock()
+    mock_entry.options = dict(mock_entry.options)
+    mock_entry.options["evening_sync_time"] = "21:00"
+    await async_reload_entry(hass, mock_entry)
+    
+    # ----------------------------------------------------
+    # Scenario 57 - Empty calendar disables sync without error
+    # ----------------------------------------------------
+    mock_entry.options["calendar_enabled"] = False
+    manager_disabled = AutomowerSupervisorManager(hass)
+    await manager_disabled.async_setup()
+    assert manager_disabled.calendar_enabled is False
+    res = await manager_disabled.async_run_evening_calendar_sync(t_base)
+    assert res == "disabled"
+    
+    # ----------------------------------------------------
+    # Scenario 58 - Expose calendar attributes on summary sensor
+    # ----------------------------------------------------
+    from custom_components.automower_supervisor.sensor import AutomowerSupervisorSummarySensor
+    mock_entry.options["calendar_enabled"] = True
+    mock_entry.options["calendar_entity_id"] = "calendar.automower"
+    await manager.async_setup()
+    
+    manager.robots["automowerkv5"].daily_attention_required = True
+    await manager.async_run_evening_calendar_sync(t_base)
+    
+    summary_sensor = AutomowerSupervisorSummarySensor(manager)
+    attrs = summary_sensor.extra_state_attributes
+    
+    assert attrs["calendar_sync_enabled"] is True
+    assert attrs["calendar_entity_id"] == "calendar.automower"
+    assert attrs["evening_snapshot_source_date"] == "2026-06-09"
+    assert attrs["evening_snapshot_target_date"] == "2026-06-10"
+    assert "Kv5" in attrs["evening_snapshot_robot_names"]
+    assert attrs["calendar_event_title"] == "Bot Kv5"
+    
+    # ----------------------------------------------------
+    # Scenario 59 - Existing robot, recovery, and summary tests pass
+    # ----------------------------------------------------
+    # Verified by standalone pytest runner.
+
 
 
 

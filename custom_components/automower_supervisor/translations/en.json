@@ -9,5 +9,21 @@
     "abort": {
       "already_configured": "Service is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options for Automower Supervisor",
+        "description": "Configure calendar synchronization settings.",
+        "data": {
+          "calendar_enabled": "Enable calendar synchronization",
+          "calendar_entity_id": "Target calendar entity",
+          "evening_sync_time": "Evening sync time (HH:MM)",
+          "morning_sync_time": "Morning sync time (HH:MM)",
+          "calendar_event_start_time": "Event start time (HH:MM)",
+          "calendar_event_duration_minutes": "Event duration (minutes)"
+        }
+      }
+    }
   }
 }

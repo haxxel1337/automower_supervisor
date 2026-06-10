@@ -9,5 +9,21 @@
     "abort": {
       "already_configured": "Tjänsten är redan konfigurerad."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Inställningar för Automower Supervisor",
+        "description": "Konfigurera kalendersynkronisering.",
+        "data": {
+          "calendar_enabled": "Aktivera kalendersynkronisering",
+          "calendar_entity_id": "Målkalender-entitet",
+          "evening_sync_time": "Tid för kvällssynk (TT:MM)",
+          "morning_sync_time": "Tid för morgonsynk (TT:MM)",
+          "calendar_event_start_time": "Starttid för kalenderpost (TT:MM)",
+          "calendar_event_duration_minutes": "Längd för kalenderpost (minuter)"
+        }
+      }
+    }
   }
 }

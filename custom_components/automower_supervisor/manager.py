@@ -8,7 +8,24 @@ from homeassistant.core import HomeAssistant, Event
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 import homeassistant.util.dt as dt_util
 
-from .const import ROBOTS, ENTITY_PATTERNS, NO_ACTIVE_ERROR_VALUES, ERROR_GRACE_PERIOD_MINUTES
+import asyncio
+from .const import (
+    DOMAIN,
+    ROBOTS,
+    ENTITY_PATTERNS,
+    NO_ACTIVE_ERROR_VALUES,
+    ERROR_GRACE_PERIOD_MINUTES,
+    CONF_CALENDAR_ENTITY_ID,
+    CONF_CALENDAR_ENABLED,
+    CONF_EVENING_SYNC_TIME,
+    CONF_MORNING_SYNC_TIME,
+    CONF_CALENDAR_EVENT_START_TIME,
+    CONF_CALENDAR_EVENT_DURATION,
+    DEFAULT_EVENING_SYNC_TIME,
+    DEFAULT_MORNING_SYNC_TIME,
+    DEFAULT_CALENDAR_EVENT_START_TIME,
+    DEFAULT_CALENDAR_EVENT_DURATION,
+)
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
 from .error_classifier import classify_error
@@ -118,6 +135,20 @@ class AutomowerSupervisorManager:
         self.daily_observation_started_at: str | None = None
         self.daily_tracking_initialized: bool = False
         self.daily_attention_summary: dict[str, Any] = {}
+
+        # New for 0.5.0 (Calendar synchronization properties)
+        self.calendar_snapshot = None
+        self.event_cache: dict[str, Any] = {}
+        self.last_evening_sync_at: str | None = None
+        self.last_morning_sync_at: str | None = None
+        self.last_calendar_sync_at: str | None = None
+        self.last_calendar_sync_result: str | None = None
+        self.last_calendar_sync_error: str | None = None
+        self.morning_reconciled_at: str | None = None
+        self.morning_remaining_robot_ids: list[str] = []
+        self.morning_resolved_robot_ids: list[str] = []
+        self._calendar_sync_lock = asyncio.Lock()
+        self._unsub_calendar_timers: list[Callable[[], None]] = []
         
         # Initialize the state representation for all robots
         self.robots: dict[str, RobotState] = {}
@@ -185,6 +216,11 @@ class AutomowerSupervisorManager:
             timedelta(minutes=5)
         )
 
+        # Setup calendar timers, missed sync checks and services
+        self.setup_calendar_timers()
+        self.register_services()
+        await self.async_check_missed_syncs()
+
     async def _async_load_storage(self) -> bool:
         """Load persistent storage and apply it to the robot states. Returns True if storage changed."""
         storage_changed = False
@@ -205,6 +241,24 @@ class AutomowerSupervisorManager:
         metadata = stored_data.get("_metadata", {}) if isinstance(stored_data, dict) else {}
         self.daily_observation_started_at = metadata.get("daily_observation_started_at")
         self.daily_tracking_initialized = bool(metadata.get("daily_tracking_initialized", False))
+
+        # Load calendar state from stored data
+        calendar_data = stored_data.get("_calendar", {}) if isinstance(stored_data, dict) else {}
+        stored_snapshot = calendar_data.get("evening_snapshot")
+        self.calendar_snapshot = None
+        if stored_snapshot:
+            try:
+                from .calendar_sync import EveningAttentionSnapshot
+                self.calendar_snapshot = EveningAttentionSnapshot.from_dict(stored_snapshot)
+            except Exception as err:
+                _LOGGER.error("Failed to parse stored evening snapshot: %s", err)
+
+        self.last_evening_sync_at = calendar_data.get("last_evening_sync_at")
+        self.last_morning_sync_at = calendar_data.get("last_morning_sync_at")
+        self.last_calendar_sync_at = calendar_data.get("last_calendar_sync_at")
+        self.last_calendar_sync_result = calendar_data.get("last_calendar_sync_result")
+        self.last_calendar_sync_error = calendar_data.get("last_calendar_sync_error")
+        self.event_cache = calendar_data.get("event_cache", {})
 
         for robot_id, data in stored_data.items():
             if robot_id == "_metadata":
@@ -333,6 +387,16 @@ class AutomowerSupervisorManager:
         data["_metadata"] = {
             "daily_observation_started_at": self.daily_observation_started_at,
             "daily_tracking_initialized": self.daily_tracking_initialized,
+        }
+        data["_calendar"] = {
+            "calendar_entity_id": self.calendar_entity_id,
+            "evening_snapshot": self.calendar_snapshot.to_dict() if self.calendar_snapshot else None,
+            "event_cache": self.event_cache,
+            "last_evening_sync_at": self.last_evening_sync_at,
+            "last_morning_sync_at": self.last_morning_sync_at,
+            "last_calendar_sync_at": self.last_calendar_sync_at,
+            "last_calendar_sync_result": self.last_calendar_sync_result,
+            "last_calendar_sync_error": self.last_calendar_sync_error,
         }
         return data
 
@@ -648,6 +712,21 @@ class AutomowerSupervisorManager:
             except Exception as err:
                 _LOGGER.error("Error unsubscribing watchdog timer: %s", err)
             self._unsub_watchdog = None
+
+        # Unsubscribe calendar timers
+        for unsub in self._unsub_calendar_timers:
+            try:
+                unsub()
+            except Exception as err:
+                _LOGGER.error("Error unsubscribing calendar timer: %s", err)
+        self._unsub_calendar_timers.clear()
+
+        # Remove registered services
+        try:
+            self.hass.services.async_remove(DOMAIN, "sync_calendar")
+            self.hass.services.async_remove(DOMAIN, "delete_managed_calendar_event")
+        except Exception as err:
+            _LOGGER.error("Error removing services: %s", err)
             
         # Clear callbacks
         self._callbacks.clear()
@@ -902,3 +981,595 @@ class AutomowerSupervisorManager:
         if self.daily_observation_started_at != local_date:
             return False
         return self.daily_tracking_initialized
+
+    @property
+    def config_entry(self):
+        """Get config entry of DOMAIN."""
+        entries = self.hass.config_entries.async_entries(DOMAIN)
+        return entries[0] if entries else None
+
+    @property
+    def calendar_enabled(self) -> bool:
+        """Return True if calendar is enabled."""
+        entry = self.config_entry
+        if not entry:
+            return False
+        return bool(entry.options.get(CONF_CALENDAR_ENABLED, False))
+
+    @property
+    def calendar_entity_id(self) -> str | None:
+        """Return target calendar entity ID."""
+        entry = self.config_entry
+        if not entry:
+            return None
+        val = entry.options.get(CONF_CALENDAR_ENTITY_ID)
+        return str(val).strip() if val else None
+
+    @property
+    def evening_sync_time(self) -> str:
+        """Return evening sync time config."""
+        entry = self.config_entry
+        return entry.options.get(CONF_EVENING_SYNC_TIME, DEFAULT_EVENING_SYNC_TIME) if entry else DEFAULT_EVENING_SYNC_TIME
+
+    @property
+    def morning_sync_time(self) -> str:
+        """Return morning sync time config."""
+        entry = self.config_entry
+        return entry.options.get(CONF_MORNING_SYNC_TIME, DEFAULT_MORNING_SYNC_TIME) if entry else DEFAULT_MORNING_SYNC_TIME
+
+    @property
+    def calendar_event_start_time(self) -> str:
+        """Return event start time config."""
+        entry = self.config_entry
+        return entry.options.get(CONF_CALENDAR_EVENT_START_TIME, DEFAULT_CALENDAR_EVENT_START_TIME) if entry else DEFAULT_CALENDAR_EVENT_START_TIME
+
+    @property
+    def calendar_event_duration_minutes(self) -> int:
+        """Return event duration config in minutes."""
+        entry = self.config_entry
+        return int(entry.options.get(CONF_CALENDAR_EVENT_DURATION, DEFAULT_CALENDAR_EVENT_DURATION)) if entry else DEFAULT_CALENDAR_EVENT_DURATION
+
+    def setup_calendar_timers(self) -> None:
+        """Set up async_track_time_change timers for evening and morning syncs."""
+        for unsub in self._unsub_calendar_timers:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._unsub_calendar_timers.clear()
+
+        if not self.calendar_enabled:
+            _LOGGER.info("Calendar sync is disabled by configuration")
+            return
+
+        try:
+            ev_h, ev_m = map(int, self.evening_sync_time.split(":"))
+        except Exception:
+            ev_h, ev_m = 20, 0
+
+        try:
+            mo_h, mo_m = map(int, self.morning_sync_time.split(":"))
+        except Exception:
+            mo_h, mo_m = 11, 20
+
+        from homeassistant.helpers.event import async_track_time_change
+
+        async def evening_timer_callback(_datetime):
+            _LOGGER.info("Evening calendar sync triggered at %s", _datetime)
+            await self.async_run_evening_calendar_sync(dt_util.now())
+
+        unsub_ev = async_track_time_change(
+            self.hass,
+            evening_timer_callback,
+            hour=ev_h,
+            minute=ev_m,
+            second=0
+        )
+        self._unsub_calendar_timers.append(unsub_ev)
+
+        async def morning_timer_callback(_datetime):
+            _LOGGER.info("Morning calendar sync triggered at %s", _datetime)
+            await self.async_run_morning_calendar_sync(dt_util.now())
+
+        unsub_mo = async_track_time_change(
+            self.hass,
+            morning_timer_callback,
+            hour=mo_h,
+            minute=mo_m,
+            second=0
+        )
+        self._unsub_calendar_timers.append(unsub_mo)
+
+        _LOGGER.info(
+            "Registered calendar sync timers: evening at %02d:%02d, morning at %02d:%02d",
+            ev_h, ev_m, mo_h, mo_m
+        )
+
+    async def async_check_missed_syncs(self) -> None:
+        """Check if any scheduled syncs were missed during downtime and execute them."""
+        if not self.calendar_enabled:
+            return
+
+        from .calendar_sync import get_stockholm_timezone
+        tz = get_stockholm_timezone()
+        now = dt_util.now().astimezone(tz)
+        current_date_str = now.date().isoformat()
+
+        try:
+            ev_h, ev_m = map(int, self.evening_sync_time.split(":"))
+        except Exception:
+            ev_h, ev_m = 20, 0
+
+        try:
+            mo_h, mo_m = map(int, self.morning_sync_time.split(":"))
+        except Exception:
+            mo_h, mo_m = 11, 20
+
+        def get_date_part(iso_str: str | None) -> str | None:
+            if not iso_str:
+                return None
+            return iso_str.split("T")[0]
+
+        last_ev_date = get_date_part(self.last_evening_sync_at)
+        last_mo_date = get_date_part(self.last_morning_sync_at)
+
+        is_after_evening = (now.hour > ev_h) or (now.hour == ev_h and now.minute >= ev_m)
+        if is_after_evening and last_ev_date != current_date_str:
+            _LOGGER.info("Startup catch-up: Evening sync was missed today (last sync: %s). Running now...", self.last_evening_sync_at)
+            await self.async_run_evening_calendar_sync(now)
+
+        is_after_morning = (now.hour > mo_h) or (now.hour == mo_h and now.minute >= mo_m)
+        is_before_cutoff = (now.hour < 12) or (now.hour == 12 and now.minute == 0)
+
+        last_mo_date = get_date_part(self.last_morning_sync_at)
+        if is_after_morning and is_before_cutoff and last_mo_date != current_date_str:
+            _LOGGER.info("Startup catch-up: Morning sync was missed today (last sync: %s). Running now...", self.last_morning_sync_at)
+            await self.async_run_morning_calendar_sync(now)
+
+    async def async_run_evening_calendar_sync(self, now: datetime) -> str:
+        """Run the evening sync flow to create/update calendar event for next day."""
+        if not self.calendar_enabled:
+            return "disabled"
+
+        entity_id = self.calendar_entity_id
+        if not entity_id:
+            self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_missing"
+
+        cal_state = self.hass.states.get(entity_id)
+        if cal_state is None:
+            self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_missing"
+        if cal_state.state == "unavailable":
+            self.last_calendar_sync_result = "calendar_entity_unavailable"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_unavailable"
+
+        async with self._calendar_sync_lock:
+            try:
+                from .calendar_sync import (
+                    CalendarRobotSnapshot,
+                    EveningAttentionSnapshot,
+                    get_stockholm_timezone,
+                    build_calendar_description,
+                    get_evening_problem_desc,
+                    async_fetch_managed_event,
+                )
+
+                tz = get_stockholm_timezone()
+                local_now = now.astimezone(tz)
+                source_date_str = local_now.date().isoformat()
+
+                target_date = local_now.date() + timedelta(days=1)
+                target_date_str = target_date.isoformat()
+
+                self.evaluate_all_daily_attention(now)
+
+                attention_robots = []
+                for robot_id, state in self.robots.items():
+                    if state.daily_attention_required:
+                        severity = "warning"
+                        code = state.daily_attention_reason_codes[0] if state.daily_attention_reason_codes else ""
+                        if code in (
+                            "ACTIVE_ERROR",
+                            "CLEARED_BUT_UNVERIFIED",
+                            "FAILED_RECOVERY",
+                            "ROBOT_OFFLINE",
+                            "SESSION_LOST_OFFLINE",
+                            "ERROR_DURING_MOWING",
+                            "ERROR_AFTER_MOWING",
+                        ):
+                            severity = "critical"
+
+                        snap = CalendarRobotSnapshot(
+                            robot_id=robot_id,
+                            display_name=state.display_name,
+                            severity=severity,
+                            reason_codes=list(state.daily_attention_reason_codes),
+                            text=state.daily_attention_text or "",
+                            captured_at=local_now.isoformat(),
+                            current_status_plain=state.current_status_plain,
+                            current_battery=state.current_battery,
+                            online=state.online,
+                            last_real_error=state.last_real_error,
+                            recovery_state=str(state.recovery_state.value),
+                            last_mowing_attempt_result=state.last_mowing_attempt_result,
+                        )
+                        attention_robots.append(snap)
+
+                snapshot = EveningAttentionSnapshot(
+                    source_date=source_date_str,
+                    target_calendar_date=target_date_str,
+                    captured_at=local_now.isoformat(),
+                    robots=attention_robots,
+                )
+
+                self.calendar_snapshot = snapshot
+                self.last_evening_sync_at = local_now.isoformat()
+                await self._storage.async_save(self.get_storage_data())
+
+                existing_event = await async_fetch_managed_event(self.hass, entity_id, target_date_str)
+
+                from .const import ROBOTS
+                sorted_robots = []
+                for r_id in ROBOTS:
+                    for r in attention_robots:
+                        if r.robot_id == r_id:
+                            sorted_robots.append(r)
+                            break
+
+                result_code = "no_event_needed"
+
+                start_time_str = self.calendar_event_start_time
+                duration_mins = self.calendar_event_duration_minutes
+                try:
+                    start_h, start_m = map(int, start_time_str.split(":"))
+                except Exception:
+                    start_h, start_m = 12, 0
+
+                event_start = datetime.fromisoformat(f"{target_date_str}T{start_h:02d}:{start_m:02d}:00").replace(tzinfo=tz)
+                event_end = event_start + timedelta(minutes=duration_mins)
+
+                if sorted_robots:
+                    title = "Bot " + ", ".join([r.display_name for r in sorted_robots])
+                    robots_data = []
+                    for r in sorted_robots:
+                        robots_data.append({
+                            "display_name": r.display_name,
+                            "evening_text": get_evening_problem_desc(r),
+                            "current_status": r.current_status_plain or "saknas",
+                            "battery": r.current_battery,
+                        })
+
+                    description = build_calendar_description(
+                        robots_data=robots_data,
+                        sync_time_str=local_now.strftime("%Y-%m-%d %H:%M"),
+                        date_str=target_date_str,
+                        is_morning=False,
+                    )
+
+                    if existing_event:
+                        component = self.hass.data.get("calendar")
+                        entity = component.get_entity(entity_id) if component else None
+                        if entity and existing_event.get("uid"):
+                            await entity.async_delete_event(existing_event["uid"])
+                            result_code = "replaced"
+                    else:
+                        result_code = "created"
+
+                    await self.hass.services.async_call(
+                        "calendar",
+                        "create_event",
+                        {
+                            "entity_id": entity_id,
+                            "summary": title,
+                            "description": description,
+                            "start_date_time": event_start.strftime("%Y-%m-%d %H:%M:%S"),
+                            "end_date_time": event_end.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        blocking=True,
+                    )
+
+                    fetched = await async_fetch_managed_event(self.hass, entity_id, target_date_str)
+                    if fetched:
+                        self.event_cache = {
+                            "date": target_date_str,
+                            "uid": fetched.get("uid"),
+                            "event_id": fetched.get("uid"),
+                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{target_date_str}]",
+                        }
+                    else:
+                        self.event_cache = {
+                            "date": target_date_str,
+                            "uid": None,
+                            "event_id": None,
+                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{target_date_str}]",
+                        }
+                else:
+                    if existing_event:
+                        component = self.hass.data.get("calendar")
+                        entity = component.get_entity(entity_id) if component else None
+                        if entity and existing_event.get("uid"):
+                            await entity.async_delete_event(existing_event["uid"])
+                            result_code = "deleted"
+                    self.event_cache = {}
+
+                self.last_calendar_sync_result = result_code
+                self.last_calendar_sync_error = None
+                self.last_calendar_sync_at = local_now.isoformat()
+
+                await self._storage.async_save(self.get_storage_data())
+                self._notify_callbacks()
+                return result_code
+
+            except Exception as err:
+                _LOGGER.error("Error during evening calendar sync: %s", err)
+                self.last_calendar_sync_result = "error"
+                self.last_calendar_sync_error = str(err)
+                self.last_calendar_sync_at = dt_util.now().isoformat()
+                self._notify_callbacks()
+                return "error"
+
+    async def async_run_morning_calendar_sync(self, now: datetime) -> str:
+        """Run the morning sync flow to reconcile evening snapshot and current state."""
+        if not self.calendar_enabled:
+            return "disabled"
+
+        entity_id = self.calendar_entity_id
+        if not entity_id:
+            self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_missing"
+
+        cal_state = self.hass.states.get(entity_id)
+        if cal_state is None:
+            self.last_calendar_sync_result = "calendar_entity_missing"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_missing"
+        if cal_state.state == "unavailable":
+            self.last_calendar_sync_result = "calendar_entity_unavailable"
+            self.last_calendar_sync_at = dt_util.now().isoformat()
+            self._notify_callbacks()
+            return "calendar_entity_unavailable"
+
+        async with self._calendar_sync_lock:
+            try:
+                from .calendar_sync import (
+                    get_stockholm_timezone,
+                    evaluate_morning_resolution,
+                    build_calendar_description,
+                    get_evening_problem_desc,
+                    async_fetch_managed_event,
+                )
+
+                tz = get_stockholm_timezone()
+                local_now = now.astimezone(tz)
+                current_date_str = local_now.date().isoformat()
+
+                snapshot = self.calendar_snapshot
+                snapshot_robots_by_id = {}
+                if snapshot and snapshot.target_calendar_date == current_date_str:
+                    snapshot_robots_by_id = {r.robot_id: r for r in snapshot.robots}
+                else:
+                    _LOGGER.info(
+                        "No matching evening snapshot for today's morning sync (snapshot target: %s, today: %s)",
+                        snapshot.target_calendar_date if snapshot else None,
+                        current_date_str,
+                    )
+
+                remaining_robots_data = []
+                morning_remaining_robot_ids = []
+                morning_resolved_robot_ids = []
+
+                for robot_id, snap_r in snapshot_robots_by_id.items():
+                    current_state = self.robots[robot_id]
+                    res = evaluate_morning_resolution(snap_r, current_state, local_now)
+                    if res.keep:
+                        morning_remaining_robot_ids.append(robot_id)
+                        remaining_robots_data.append({
+                            "robot_id": robot_id,
+                            "display_name": current_state.display_name,
+                            "evening_text": get_evening_problem_desc(snap_r),
+                            "current_status": current_state.current_status_plain or current_state.current_status or "saknas",
+                            "battery": current_state.current_battery,
+                            "recovery_state": str(current_state.recovery_state.value) if current_state.recovery_state != RecoveryState.NONE else "none",
+                            "morning_status_text": res.text,
+                        })
+                    else:
+                        morning_resolved_robot_ids.append(robot_id)
+
+                for robot_id, current_state in self.robots.items():
+                    if robot_id in snapshot_robots_by_id:
+                        continue
+
+                    is_critical_now = (
+                        current_state.current_error_active is True
+                        or current_state.binary_error == "on"
+                        or current_state.recovery_state in (RecoveryState.ACTIVE_ERROR, RecoveryState.CLEARED_BUT_UNVERIFIED)
+                        or current_state.failed_recovery is True
+                        or current_state.online is False
+                    )
+
+                    if is_critical_now:
+                        morning_remaining_robot_ids.append(robot_id)
+
+                        if current_state.online is False:
+                            morning_status_text = "Roboten är offline."
+                        elif current_state.current_error_active is True or current_state.binary_error == "on" or current_state.recovery_state == RecoveryState.ACTIVE_ERROR:
+                            morning_status_text = f"Aktivt fel \"{current_state.last_real_error or 'Okänt fel'}\"."
+                        elif current_state.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
+                            morning_status_text = f"Tidigare fel \"{current_state.last_real_error or 'Okänt fel'}\" är nollställt men inte verifierat återställt."
+                        elif current_state.failed_recovery is True:
+                            morning_status_text = "Misslyckad återhämtning efter fel."
+                        else:
+                            morning_status_text = "Kritiskt problem upptäckt under natten."
+
+                        remaining_robots_data.append({
+                            "robot_id": robot_id,
+                            "display_name": current_state.display_name,
+                            "evening_text": "Inget problem rapporterat igår kväll.",
+                            "current_status": current_state.current_status_plain or current_state.current_status or "saknas",
+                            "battery": current_state.current_battery,
+                            "recovery_state": str(current_state.recovery_state.value) if current_state.recovery_state != RecoveryState.NONE else "none",
+                            "morning_status_text": morning_status_text,
+                        })
+
+                from .const import ROBOTS
+                sorted_remaining_data = []
+                for r_id in ROBOTS:
+                    for r_data in remaining_robots_data:
+                        if r_data["robot_id"] == r_id:
+                            sorted_remaining_data.append(r_data)
+                            break
+
+                self.morning_reconciled_at = local_now.isoformat()
+                self.morning_remaining_robot_ids = morning_remaining_robot_ids
+                self.morning_resolved_robot_ids = morning_resolved_robot_ids
+
+                existing_event = await async_fetch_managed_event(self.hass, entity_id, current_date_str)
+
+                result_code = "no_event_needed"
+
+                start_time_str = self.calendar_event_start_time
+                duration_mins = self.calendar_event_duration_minutes
+                try:
+                    start_h, start_m = map(int, start_time_str.split(":"))
+                except Exception:
+                    start_h, start_m = 12, 0
+
+                event_start = datetime.fromisoformat(f"{current_date_str}T{start_h:02d}:{start_m:02d}:00").replace(tzinfo=tz)
+                event_end = event_start + timedelta(minutes=duration_mins)
+
+                if sorted_remaining_data:
+                    title = "Bot " + ", ".join([r["display_name"] for r in sorted_remaining_data])
+                    description = build_calendar_description(
+                        robots_data=sorted_remaining_data,
+                        sync_time_str=local_now.strftime("%Y-%m-%d %H:%M"),
+                        date_str=current_date_str,
+                        is_morning=True,
+                    )
+
+                    if existing_event:
+                        component = self.hass.data.get("calendar")
+                        entity = component.get_entity(entity_id) if component else None
+                        if entity and existing_event.get("uid"):
+                            await entity.async_delete_event(existing_event["uid"])
+                            result_code = "replaced"
+                    else:
+                        result_code = "created"
+
+                    await self.hass.services.async_call(
+                        "calendar",
+                        "create_event",
+                        {
+                            "entity_id": entity_id,
+                            "summary": title,
+                            "description": description,
+                            "start_date_time": event_start.strftime("%Y-%m-%d %H:%M:%S"),
+                            "end_date_time": event_end.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        blocking=True,
+                    )
+
+                    fetched = await async_fetch_managed_event(self.hass, entity_id, current_date_str)
+                    if fetched:
+                        self.event_cache = {
+                            "date": current_date_str,
+                            "uid": fetched.get("uid"),
+                            "event_id": fetched.get("uid"),
+                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{current_date_str}]",
+                        }
+                    else:
+                        self.event_cache = {
+                            "date": current_date_str,
+                            "uid": None,
+                            "event_id": None,
+                            "marker": f"[AUTOMOWER_SUPERVISOR:v1:{current_date_str}]",
+                        }
+                else:
+                    if existing_event:
+                        component = self.hass.data.get("calendar")
+                        entity = component.get_entity(entity_id) if component else None
+                        if entity and existing_event.get("uid"):
+                            await entity.async_delete_event(existing_event["uid"])
+                            result_code = "deleted"
+                    self.event_cache = {}
+
+                self.last_morning_sync_at = local_now.isoformat()
+                self.last_calendar_sync_result = result_code
+                self.last_calendar_sync_error = None
+                self.last_calendar_sync_at = local_now.isoformat()
+
+                await self._storage.async_save(self.get_storage_data())
+                self._notify_callbacks()
+                return result_code
+
+            except Exception as err:
+                _LOGGER.error("Error during morning calendar sync: %s", err)
+                self.last_calendar_sync_result = "error"
+                self.last_calendar_sync_error = str(err)
+                self.last_calendar_sync_at = dt_util.now().isoformat()
+                self._notify_callbacks()
+                return "error"
+
+    def register_services(self) -> None:
+        """Register services for calendar synchronization."""
+        
+        async def sync_calendar_service(call):
+            mode = call.data.get("mode", "auto")
+            now = dt_util.now()
+            from .calendar_sync import get_stockholm_timezone
+            tz = get_stockholm_timezone()
+            local_now = now.astimezone(tz)
+            
+            if mode == "evening":
+                await self.async_run_evening_calendar_sync(now)
+            elif mode == "morning":
+                await self.async_run_morning_calendar_sync(now)
+            else: # auto
+                if local_now.hour < 12:
+                    await self.async_run_morning_calendar_sync(now)
+                else:
+                    await self.async_run_evening_calendar_sync(now)
+
+        self.hass.services.async_register(
+            DOMAIN,
+            "sync_calendar",
+            sync_calendar_service,
+        )
+
+        async def delete_managed_calendar_event_service(call):
+            entity_id = self.calendar_entity_id
+            if not entity_id:
+                return
+            
+            from .calendar_sync import get_stockholm_timezone, async_fetch_managed_event
+            tz = get_stockholm_timezone()
+            now = dt_util.now()
+            local_now = now.astimezone(tz)
+            
+            for offset in (0, 1):
+                date_str = (local_now.date() + timedelta(days=offset)).isoformat()
+                existing_event = await async_fetch_managed_event(self.hass, entity_id, date_str)
+                if existing_event:
+                    component = self.hass.data.get("calendar")
+                    entity = component.get_entity(entity_id) if component else None
+                    if entity and existing_event.get("uid"):
+                        await entity.async_delete_event(existing_event["uid"])
+            
+            self.event_cache = {}
+            await self._storage.async_save(self.get_storage_data())
+            self._notify_callbacks()
+
+        self.hass.services.async_register(
+            DOMAIN,
+            "delete_managed_calendar_event",
+            delete_managed_calendar_event_service,
+        )
