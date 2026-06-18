@@ -25,6 +25,13 @@ from .const import (
     DEFAULT_MORNING_SYNC_TIME,
     DEFAULT_CALENDAR_EVENT_START_TIME,
     DEFAULT_CALENDAR_EVENT_DURATION,
+    TARGETED_WAKEUP_HOUR,
+    TARGETED_WAKEUP_MINUTE,
+    MORNING_AUTO_WAIT_SECONDS,
+    MORNING_START_WAIT_SECONDS,
+    ROBOT_COMMAND_GAP_SECONDS,
+    AUTO_RESET_LATCH_MINUTES,
+    AUTO_RESET_STEP_DELAY_SECONDS,
 )
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
@@ -149,6 +156,9 @@ class AutomowerSupervisorManager:
         self.morning_remaining_robot_ids: list[str] = []
         self.morning_resolved_robot_ids: list[str] = []
         self._calendar_sync_lock = asyncio.Lock()
+        self._robot_command_lock = asyncio.Lock()
+        self._morning_wakeup_task: asyncio.Task | None = None
+        self._auto_reset_tasks: dict[str, asyncio.Task] = {}
         self._unsub_calendar_timers: list[Callable[[], None]] = []
         
         # Initialize the state representation for all robots
@@ -294,6 +304,16 @@ class AutomowerSupervisorManager:
             state.mowing_attempted_today = bool(data.get("mowing_attempted_today", False))
             state.failed_recovery = bool(data.get("failed_recovery", False))
             state.recovery_verified_at = data.get("recovery_verified_at")
+            state.morning_wakeup_attempted_date = data.get("morning_wakeup_attempted_date")
+            state.morning_wakeup_attempted_at = data.get("morning_wakeup_attempted_at")
+            state.morning_wakeup_result = data.get("morning_wakeup_result")
+            state.morning_wakeup_stage = data.get("morning_wakeup_stage")
+            state.auto_reset_attempted_at = data.get("auto_reset_attempted_at")
+            state.auto_reset_incident_at = data.get("auto_reset_incident_at")
+            state.auto_reset_error_message = data.get("auto_reset_error_message")
+            state.auto_reset_result = data.get("auto_reset_result")
+            state.auto_reset_stage = data.get("auto_reset_stage")
+            state.auto_reset_in_progress = False
             
             # Backfill and normalize error category
             stored_category = data.get("last_real_error_category")
@@ -379,6 +399,15 @@ class AutomowerSupervisorManager:
                 "failed_recovery": state.failed_recovery,
                 "recovery_verified_at": state.recovery_verified_at,
                 "last_real_error_category": state.last_real_error_category,
+                "morning_wakeup_attempted_date": state.morning_wakeup_attempted_date,
+                "morning_wakeup_attempted_at": state.morning_wakeup_attempted_at,
+                "morning_wakeup_result": state.morning_wakeup_result,
+                "morning_wakeup_stage": state.morning_wakeup_stage,
+                "auto_reset_attempted_at": state.auto_reset_attempted_at,
+                "auto_reset_incident_at": state.auto_reset_incident_at,
+                "auto_reset_error_message": state.auto_reset_error_message,
+                "auto_reset_result": state.auto_reset_result,
+                "auto_reset_stage": state.auto_reset_stage,
                 "pending_mowing_confirmation": state.pending_mowing_confirmation,
                 "pending_confirmation_ended_at": state.pending_confirmation_ended_at,
                 "pending_confirmation_mowing_seconds": state.pending_confirmation_mowing_seconds,
@@ -699,6 +728,227 @@ class AutomowerSupervisorManager:
                     
         return changed
 
+    @staticmethod
+    def _robonect_button_ids(robot_id: str) -> dict[str, str]:
+        """Return the Robonect command button IDs for one robot."""
+        return {
+            "auto": f"button.{robot_id}_auto",
+            "start": f"button.{robot_id}_start",
+            "stop": f"button.{robot_id}_stop",
+            "error_reset": f"button.{robot_id}_error_reset",
+        }
+
+    def _button_available(self, entity_id: str) -> bool:
+        """Return whether a Robonect button entity is available."""
+        entity_state = self.hass.states.get(entity_id)
+        return entity_state is not None and entity_state.state not in (
+            "unknown",
+            "unavailable",
+        )
+
+    async def _async_press_robonect_button(self, entity_id: str) -> None:
+        """Queue a Robonect button press without blocking on its REST request."""
+        if not self._button_available(entity_id):
+            raise RuntimeError(f"Button unavailable: {entity_id}")
+        await self.hass.services.async_call(
+            "button",
+            "press",
+            {"entity_id": entity_id},
+            blocking=False,
+        )
+
+    @staticmethod
+    def _resting_status(state: RobotState) -> bool:
+        """Return whether a healthy robot is stationary and may need waking."""
+        status = (
+            state.current_status_plain or state.current_status or ""
+        ).strip().lower()
+        return status in {"charging", "parked", "sleeping", "stopped", "off"}
+
+    def _targeted_wakeup_eligible(self, state: RobotState, local_date: str) -> bool:
+        """Return whether one robot may receive the 09:00 wake-up sequence."""
+        if state.morning_wakeup_attempted_date == local_date:
+            return False
+        if state.online is not True:
+            return False
+        if state.source_age_minutes is None or state.source_age_minutes > 15:
+            return False
+        if state.current_error_active or state.binary_error == "on":
+            return False
+        if state.recovery_state == RecoveryState.ACTIVE_ERROR:
+            return False
+        return self._resting_status(state)
+
+    async def _async_run_targeted_morning_wakeup(
+        self,
+        now: datetime | None = None,
+    ) -> None:
+        """Wake only eligible resting robots, one at a time."""
+        from .calendar_sync import get_stockholm_timezone
+
+        local_now = (now or dt_util.now()).astimezone(get_stockholm_timezone())
+        local_date = local_now.date().isoformat()
+
+        async with self._robot_command_lock:
+            for robot_id, state in self.robots.items():
+                if not self._targeted_wakeup_eligible(state, local_date):
+                    continue
+
+                buttons = self._robonect_button_ids(robot_id)
+                state.morning_wakeup_attempted_date = local_date
+                state.morning_wakeup_attempted_at = dt_util.as_utc(local_now).isoformat()
+                state.morning_wakeup_stage = "auto"
+                state.morning_wakeup_result = "in_progress"
+                await self._storage.async_save(self.get_storage_data())
+                self._notify_callbacks()
+
+                try:
+                    await self._async_press_robonect_button(buttons["auto"])
+                    await asyncio.sleep(MORNING_AUTO_WAIT_SECONDS)
+
+                    self.sync_initial_states(is_startup=False)
+                    if self._resting_status(state):
+                        state.morning_wakeup_stage = "start"
+                        await self._async_press_robonect_button(buttons["start"])
+                        await asyncio.sleep(MORNING_START_WAIT_SECONDS)
+
+                        state.morning_wakeup_stage = "auto_after_start"
+                        await self._async_press_robonect_button(buttons["auto"])
+                        state.morning_wakeup_result = "auto_start_auto_sent"
+                    else:
+                        state.morning_wakeup_result = "auto_was_sufficient"
+
+                    state.morning_wakeup_stage = "complete"
+                except Exception as err:
+                    _LOGGER.error(
+                        "Targeted morning wake-up failed for %s at %s: %s",
+                        robot_id,
+                        state.morning_wakeup_stage,
+                        err,
+                    )
+                    state.morning_wakeup_result = f"command_error: {err}"
+                finally:
+                    await self._storage.async_save(self.get_storage_data())
+                    self._notify_callbacks()
+
+                await asyncio.sleep(ROBOT_COMMAND_GAP_SECONDS)
+
+    def _latched_error_reset_eligible(self, state: RobotState, now: datetime) -> bool:
+        """Return True only for stale error text while already mowing."""
+        if state.auto_reset_in_progress:
+            return False
+        if state.current_error_active is not True:
+            return False
+        if state.binary_error != "off":
+            return False
+        if state.online is not True:
+            return False
+        if state.source_age_minutes is None or state.source_age_minutes > 15:
+            return False
+
+        status = (
+            state.current_status_plain or state.current_status or ""
+        ).strip().lower()
+        if status != "mowing":
+            return False
+
+        error_text = (state.current_error_message or "").strip()
+        if not error_text or error_text.lower() in NO_ACTIVE_ERROR_VALUES:
+            return False
+
+        incident_at = state.last_real_error_at
+        if not incident_at or state.auto_reset_incident_at == incident_at:
+            return False
+
+        try:
+            incident_dt = datetime.fromisoformat(incident_at)
+            age = (
+                dt_util.as_utc(now) - dt_util.as_utc(incident_dt)
+            ).total_seconds()
+        except (TypeError, ValueError):
+            return False
+
+        return age >= AUTO_RESET_LATCH_MINUTES * 60
+
+    async def _async_run_latched_error_reset(self, robot_id: str, now: datetime) -> None:
+        """Run STOP -> RESET -> START -> AUTO for one eligible mower."""
+        state = self.robots[robot_id]
+
+        async with self._robot_command_lock:
+            if not self._latched_error_reset_eligible(state, now):
+                return
+
+            buttons = self._robonect_button_ids(robot_id)
+            state.auto_reset_in_progress = True
+            state.auto_reset_attempted_at = dt_util.as_utc(now).isoformat()
+            state.auto_reset_incident_at = state.last_real_error_at
+            state.auto_reset_error_message = state.current_error_message
+            state.auto_reset_result = "in_progress"
+            state.auto_reset_stage = "stop"
+            await self._storage.async_save(self.get_storage_data())
+            self._notify_callbacks()
+
+            try:
+                await self._async_press_robonect_button(buttons["stop"])
+                await asyncio.sleep(AUTO_RESET_STEP_DELAY_SECONDS)
+
+                state.auto_reset_stage = "error_reset"
+                await self._async_press_robonect_button(buttons["error_reset"])
+                await asyncio.sleep(AUTO_RESET_STEP_DELAY_SECONDS)
+
+                state.auto_reset_stage = "start"
+                await self._async_press_robonect_button(buttons["start"])
+                await asyncio.sleep(AUTO_RESET_STEP_DELAY_SECONDS)
+
+                state.auto_reset_stage = "auto"
+                await self._async_press_robonect_button(buttons["auto"])
+
+                state.auto_reset_stage = "complete"
+                state.auto_reset_result = "commands_sent_awaiting_verification"
+            except Exception as err:
+                _LOGGER.error(
+                    "Latched-error reset failed for %s at %s: %s",
+                    robot_id,
+                    state.auto_reset_stage,
+                    err,
+                )
+                state.auto_reset_result = f"command_error: {err}"
+            finally:
+                state.auto_reset_in_progress = False
+                await self._storage.async_save(self.get_storage_data())
+                self._notify_callbacks()
+
+    def _schedule_latched_error_reset_if_needed(
+        self,
+        robot_id: str,
+        now: datetime,
+    ) -> bool:
+        """Schedule one reset task without blocking the watchdog."""
+        state = self.robots[robot_id]
+        task = self._auto_reset_tasks.get(robot_id)
+        if task is not None and not task.done():
+            return False
+        if not self._latched_error_reset_eligible(state, now):
+            return False
+
+        task = self.hass.async_create_task(
+            self._async_run_latched_error_reset(robot_id, now)
+        )
+        self._auto_reset_tasks[robot_id] = task
+        return True
+
+    async def _async_service_window_reconciliation_tick(self, now: datetime) -> None:
+        """Reconcile calendar every five minutes from 11:20 through 12:15."""
+        from .calendar_sync import get_stockholm_timezone, is_service_day
+
+        local_now = now.astimezone(get_stockholm_timezone())
+        if not is_service_day(local_now.date()):
+            return
+
+        minutes = local_now.hour * 60 + local_now.minute
+        if 11 * 60 + 20 <= minutes <= 12 * 60 + 15:
+            await self.async_run_morning_calendar_sync(local_now)
+
     def async_register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback for update notifications."""
         if callback not in self._callbacks:
@@ -734,6 +984,15 @@ class AutomowerSupervisorManager:
             except Exception as err:
                 _LOGGER.error("Error unsubscribing watchdog timer: %s", err)
             self._unsub_watchdog = None
+
+        if self._morning_wakeup_task is not None and not self._morning_wakeup_task.done():
+            self._morning_wakeup_task.cancel()
+        self._morning_wakeup_task = None
+
+        for task in self._auto_reset_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._auto_reset_tasks.clear()
 
         # Unsubscribe calendar timers
         for unsub in self._unsub_calendar_timers:
@@ -880,6 +1139,9 @@ class AutomowerSupervisorManager:
             if state.pending_mowing_confirmation:
                 if check_pending_mowing_confirmation(state, now):
                     storage_changed = True
+
+            if self._schedule_latched_error_reset_if_needed(robot_id, now):
+                storage_changed = True
             
         if storage_changed:
             _LOGGER.debug("Storage changed during watchdog check, scheduling delayed save")
@@ -1102,9 +1364,36 @@ class AutomowerSupervisorManager:
         )
         self._unsub_calendar_timers.append(unsub_mo)
 
+        async def targeted_wakeup_callback(_datetime):
+            if self._morning_wakeup_task is None or self._morning_wakeup_task.done():
+                self._morning_wakeup_task = self.hass.async_create_task(
+                    self._async_run_targeted_morning_wakeup(dt_util.now())
+                )
+
+        unsub_wakeup = async_track_time_change(
+            self.hass,
+            targeted_wakeup_callback,
+            hour=TARGETED_WAKEUP_HOUR,
+            minute=TARGETED_WAKEUP_MINUTE,
+            second=0,
+        )
+        self._unsub_calendar_timers.append(unsub_wakeup)
+
+        async def reconciliation_interval_callback(_datetime):
+            await self._async_service_window_reconciliation_tick(dt_util.now())
+
+        unsub_reconcile = async_track_time_interval(
+            self.hass,
+            reconciliation_interval_callback,
+            timedelta(minutes=5),
+        )
+        self._unsub_calendar_timers.append(unsub_reconcile)
+
         _LOGGER.info(
-            "Registered calendar sync timers: evening at %02d:%02d, morning at %02d:%02d",
-            ev_h, ev_m, mo_h, mo_m
+            "Registered calendar sync timers: evening at %02d:%02d, morning at %02d:%02d, "
+            "targeted wake-up at %02d:%02d, service-window reconciliation every 5 minutes",
+            ev_h, ev_m, mo_h, mo_m,
+            TARGETED_WAKEUP_HOUR, TARGETED_WAKEUP_MINUTE,
         )
 
     async def async_check_missed_syncs(self) -> None:

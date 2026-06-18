@@ -119,6 +119,20 @@ class RobotState:
     recovery_verified_at: str | None = None
     last_real_error_category: str = "none"
 
+    # Targeted morning wake-up diagnostics (Persisted)
+    morning_wakeup_attempted_date: str | None = None
+    morning_wakeup_attempted_at: str | None = None
+    morning_wakeup_result: str | None = None
+    morning_wakeup_stage: str | None = None
+
+    # Safe Robonect latched-error recovery diagnostics (Persisted)
+    auto_reset_attempted_at: str | None = None
+    auto_reset_incident_at: str | None = None
+    auto_reset_error_message: str | None = None
+    auto_reset_result: str | None = None
+    auto_reset_stage: str | None = None
+    auto_reset_in_progress: bool = False
+
     # Charging trend monitoring (Persisted)
     charging_started_at: str | None = None
     charging_last_sample_at: str | None = None

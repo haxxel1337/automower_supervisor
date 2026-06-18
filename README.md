@@ -1,6 +1,19 @@
-# Automower Supervisor v0.5.6
+# Automower Supervisor v0.5.7
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.7
+
+- **Targeted 09:00 Wake-Up**: Evaluates each mower individually and only commands healthy, online robots with fresh data that remain stationary.
+- **Minimal Command Sequence**: Sends AUTO first. START is sent only if the mower remains stationary, followed by AUTO to restore automatic mode.
+- **One Robot at a Time**: Serializes Robonect commands to reduce REST load and avoid command collisions.
+- **Safe Latched-Error Recovery**: For a mower already in Mowing with binary error off but stale Robonect error text, sends STOP → ERROR RESET → START → AUTO with controlled delays.
+- **Strict Safety Gates**: No automatic recovery for offline, stale, faulted, stopped, or binary-error-active mowers.
+- **One Attempt per Incident/Day**: Morning wake-up is attempted once per mower per day; latched-error recovery once per error incident.
+- **Non-Blocking Orchestration**: Long command sequences run as background tasks and do not hold the watchdog.
+- **Frequent Calendar Reconciliation**: Rechecks every five minutes from 11:20 through 12:15 on service days.
+- **Robonect Startup Ordering**: Adds `after_dependencies: ["robonect"]`.
+- **Diagnostics and Tests**: Exposes command stages/results and adds regression tests.
 
 ## Improvements in version 0.5.6
 

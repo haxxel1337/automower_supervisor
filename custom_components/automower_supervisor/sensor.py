@@ -364,6 +364,18 @@ class AutomowerRobotSensor(SensorEntity):
             "failed_recovery": state_data.failed_recovery,
             "recovery_verified_at": state_data.recovery_verified_at,
             "last_real_error_category": state_data.last_real_error_category,
+            # Targeted morning wake-up
+            "morning_wakeup_attempted_date": state_data.morning_wakeup_attempted_date,
+            "morning_wakeup_attempted_at": state_data.morning_wakeup_attempted_at,
+            "morning_wakeup_result": state_data.morning_wakeup_result,
+            "morning_wakeup_stage": state_data.morning_wakeup_stage,
+            # Safe Robonect latched-error recovery
+            "auto_reset_attempted_at": state_data.auto_reset_attempted_at,
+            "auto_reset_incident_at": state_data.auto_reset_incident_at,
+            "auto_reset_error_message": state_data.auto_reset_error_message,
+            "auto_reset_result": state_data.auto_reset_result,
+            "auto_reset_stage": state_data.auto_reset_stage,
+            "auto_reset_in_progress": state_data.auto_reset_in_progress,
             # Charging trend monitoring
             "charging_started_at": state_data.charging_started_at,
             "charging_last_sample_at": state_data.charging_last_sample_at,

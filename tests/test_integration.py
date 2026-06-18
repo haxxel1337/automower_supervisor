@@ -673,8 +673,9 @@ async def test_watchdog_scenarios() -> None:
     manager = AutomowerSupervisorManager(hass)
     await manager.async_setup()
     
-    # 8. Watchdog timer is registered during setup with interval of 5 minutes
-    assert len(hass._mock_time_callbacks) == 1
+    # 8. v0.5.7 registers watchdog + service-window reconciliation.
+    # Both interval callbacks run every five minutes.
+    assert len(hass._mock_time_callbacks) == 2
     action, interval = hass._mock_time_callbacks[0]
     assert interval == datetime.timedelta(minutes=5)
     
@@ -926,8 +927,9 @@ async def test_setup_optimizations() -> None:
     assert cb_called is True
     
     # 4. Timer registrations
-    # Check interval for manager2 timer registration (2 timers total now: one for manager, one for manager2)
-    assert len(hass._mock_time_callbacks) == 2
+    # Each manager registers two interval callbacks in v0.5.7:
+    # watchdog + service-window reconciliation.
+    assert len(hass._mock_time_callbacks) == 4
     assert hass._mock_time_callbacks[0][1] == datetime.timedelta(minutes=5)
     assert hass._mock_time_callbacks[1][1] == datetime.timedelta(minutes=5)
 
@@ -4788,3 +4790,152 @@ async def test_non_service_morning_reconciles_snapshot_without_calendar_write() 
     assert manager.event_cache == {}
     hass.services.async_call.assert_not_awaited()
     manager._storage.async_save.assert_awaited()
+
+
+
+@pytest.mark.asyncio
+async def test_v057_targeted_morning_wakeup_sequence() -> None:
+    import datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, call, patch
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    hass.states.get.return_value = SimpleNamespace(state="ok")
+    hass.services.async_call = AsyncMock()
+    manager = AutomowerSupervisorManager(hass)
+    manager._storage.async_save = AsyncMock()
+
+    for item in manager.robots.values():
+        item.online = False
+
+    state = manager.robots["automowerkv5"]
+    state.online = True
+    state.source_age_minutes = 0
+    state.current_error_active = False
+    state.binary_error = "off"
+    state.current_status_plain = "Charging"
+    manager.sync_initial_states = MagicMock(return_value=False)
+
+    now = datetime.datetime(2026, 6, 18, 9, 0, tzinfo=datetime.timezone.utc)
+    with patch(
+        "custom_components.automower_supervisor.manager.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        await manager._async_run_targeted_morning_wakeup(now)
+
+    assert hass.services.async_call.await_args_list == [
+        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowerkv5_start"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=False),
+    ]
+    assert state.morning_wakeup_result == "auto_start_auto_sent"
+
+
+@pytest.mark.asyncio
+async def test_v057_targeted_wakeup_skips_mowing_and_error() -> None:
+    import datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    hass.services.async_call = AsyncMock()
+    manager = AutomowerSupervisorManager(hass)
+    manager._storage.async_save = AsyncMock()
+
+    mowing = manager.robots["automowerkv5"]
+    mowing.online = True
+    mowing.source_age_minutes = 0
+    mowing.binary_error = "off"
+    mowing.current_status_plain = "Mowing"
+
+    errored = manager.robots["automowertuv4"]
+    errored.online = True
+    errored.source_age_minutes = 0
+    errored.binary_error = "on"
+    errored.current_error_active = True
+    errored.current_status_plain = "Charging"
+
+    now = datetime.datetime(2026, 6, 18, 9, 0, tzinfo=datetime.timezone.utc)
+    await manager._async_run_targeted_morning_wakeup(now)
+    assert hass.services.async_call.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_v057_latched_error_reset_sequence_and_idempotence() -> None:
+    import datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, call, patch
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    hass.states.get.return_value = SimpleNamespace(state="ok")
+    hass.services.async_call = AsyncMock()
+    manager = AutomowerSupervisorManager(hass)
+    manager._storage.async_save = AsyncMock()
+
+    state = manager.robots["automowervv14big"]
+    state.online = True
+    state.source_age_minutes = 0
+    state.binary_error = "off"
+    state.current_error_active = True
+    state.current_status_plain = "Mowing"
+    state.current_error_message = "Vv14Stora has been lifted"
+
+    now = datetime.datetime(2026, 6, 18, 12, 0, tzinfo=datetime.timezone.utc)
+    state.last_real_error_at = (now - datetime.timedelta(minutes=3)).isoformat()
+
+    with patch(
+        "custom_components.automower_supervisor.manager.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        await manager._async_run_latched_error_reset("automowervv14big", now)
+
+    assert hass.services.async_call.await_args_list == [
+        call("button", "press", {"entity_id": "button.automowervv14big_stop"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowervv14big_error_reset"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowervv14big_start"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowervv14big_auto"}, blocking=False),
+    ]
+    assert state.auto_reset_result == "commands_sent_awaiting_verification"
+
+    with patch(
+        "custom_components.automower_supervisor.manager.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        await manager._async_run_latched_error_reset(
+            "automowervv14big",
+            now + datetime.timedelta(minutes=5),
+        )
+    assert hass.services.async_call.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_v057_service_window_reconciliation_time_gate() -> None:
+    import datetime
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    manager = AutomowerSupervisorManager(hass)
+    manager.async_run_morning_calendar_sync = AsyncMock()
+    stockholm = datetime.timezone(datetime.timedelta(hours=2))
+
+    with patch(
+        "custom_components.automower_supervisor.calendar_sync.is_service_day",
+        return_value=True,
+    ):
+        await manager._async_service_window_reconciliation_tick(
+            datetime.datetime(2026, 6, 17, 11, 25, tzinfo=stockholm)
+        )
+        manager.async_run_morning_calendar_sync.assert_awaited_once()
+        manager.async_run_morning_calendar_sync.reset_mock()
+
+        await manager._async_service_window_reconciliation_tick(
+            datetime.datetime(2026, 6, 17, 12, 16, tzinfo=stockholm)
+        )
+        manager.async_run_morning_calendar_sync.assert_not_awaited()
