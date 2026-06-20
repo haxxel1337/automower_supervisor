@@ -32,6 +32,7 @@ from .const import (
     ROBOT_COMMAND_GAP_SECONDS,
     AUTO_RESET_LATCH_MINUTES,
     AUTO_RESET_STEP_DELAY_SECONDS,
+    MOWER_DATA_STALE_MINUTES,
 )
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
@@ -1097,6 +1098,44 @@ class AutomowerSupervisorManager:
                 state.online = None
                 state.source_age_minutes = None
 
+        # Separate mower-data freshness from Robonect heartbeat/clock freshness.
+        # Clock can keep ticking while important mower values are stale.
+        mower_data_keys = [
+            "status",
+            "status_plain",
+            "battery",
+            "error_message",
+            "distance",
+            "statistic_hours",
+        ]
+        useful_mower_data = []
+        for key in mower_data_keys:
+            entity_id = state.entity_ids.get(key)
+            if not entity_id:
+                continue
+            ha_state = self.hass.states.get(entity_id)
+            if ha_state is not None and ha_state.state not in ("unavailable", "unknown"):
+                useful_mower_data.append((entity_id, ha_state))
+
+        if useful_mower_data:
+            latest_mower_state = max(
+                useful_mower_data,
+                key=lambda item: item[1].last_updated,
+            )[1]
+            mower_age_delta = (
+                dt_util.as_utc(now) - dt_util.as_utc(latest_mower_state.last_updated)
+            )
+            state.mower_data_age_minutes = max(
+                0,
+                int(mower_age_delta.total_seconds() / 60),
+            )
+            state.mower_data_stale = (
+                state.mower_data_age_minutes > MOWER_DATA_STALE_MINUTES
+            )
+        else:
+            state.mower_data_age_minutes = None
+            state.mower_data_stale = True
+
     async def _async_watchdog_check(self, now: datetime) -> None:
         """Run periodic watchdog evaluation for all robots."""
         _LOGGER.debug("Running periodic watchdog check")
@@ -1221,6 +1260,7 @@ class AutomowerSupervisorManager:
                 "CLEARED_BUT_UNVERIFIED",
                 "FAILED_RECOVERY",
                 "ROBOT_OFFLINE",
+                "MOWER_DATA_STALE",
                 "SESSION_LOST_OFFLINE",
                 "ERROR_DURING_MOWING",
                 "ERROR_AFTER_MOWING",

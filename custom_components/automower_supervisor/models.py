@@ -49,6 +49,8 @@ class RobotState:
     source_age_minutes: int | None = None
     online: bool | None = None
     stale_entities: list[str] = field(default_factory=list)
+    mower_data_age_minutes: int | None = None
+    mower_data_stale: bool = False
 
     # Active Mowing Session
     mowing_session_active: bool = False

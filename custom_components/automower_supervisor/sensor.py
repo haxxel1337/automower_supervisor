@@ -116,6 +116,17 @@ class AutomowerRobotSensor(SensorEntity):
         if state_data.charging_stalled:
             return "warning"
 
+        # 2b. Mower data stale while clock/heartbeat may still be fresh.
+        from .daily_assessment import daily_check_started
+        if state_data.mower_data_stale and state_data.mower_data_age_minutes is not None:
+            if (
+                daily_check_started(now)
+                and not state_data.confirmed_mowing_today
+                and not state_data.mowing_attempted_today
+            ):
+                return "critical"
+            return "warning"
+
         # 3. Warning state due to stale data (takes precedence over insufficient data)
         if state_data.online is True and state_data.source_age_minutes is not None and 15 < state_data.source_age_minutes <= 60:
             return "warning"
@@ -198,6 +209,8 @@ class AutomowerRobotSensor(SensorEntity):
 
         if state_data.charging_stalled:
             reasons.append("CHARGING_STALLED")
+        if state_data.mower_data_stale and state_data.mower_data_age_minutes is not None:
+            reasons.append("MOWER_DATA_STALE")
 
         # Watchdog status reason codes
         if state_data.online is False:
@@ -291,6 +304,7 @@ class AutomowerRobotSensor(SensorEntity):
             state_data.online is False
             or state_data.online is None
             or (state_data.source_age_minutes is not None and state_data.source_age_minutes > 15)
+            or (state_data.mower_data_stale and state_data.mower_data_age_minutes is not None)
         )
 
         return {
@@ -316,6 +330,8 @@ class AutomowerRobotSensor(SensorEntity):
             "last_source_update_at": state_data.last_source_update_at,
             "source_age_minutes": state_data.source_age_minutes,
             "stale_entities": state_data.stale_entities,
+            "mower_data_age_minutes": state_data.mower_data_age_minutes,
+            "mower_data_stale": state_data.mower_data_stale,
             "watchdog_checked_at": self.manager.watchdog_checked_at,
             "source_values_stale": source_values_stale,
             # Schedule properties

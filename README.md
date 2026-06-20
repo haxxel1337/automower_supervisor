@@ -1,6 +1,14 @@
-# Automower Supervisor v0.5.7
+# Automower Supervisor v0.5.8
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.8
+
+- **Mower Data Stale Detection**: Robonect clock/heartbeat can no longer hide stale mower-status values.
+- **Separate Freshness Metrics**: Adds `mower_data_age_minutes` and `mower_data_stale` so heartbeat freshness and mower data freshness can be diagnosed separately.
+- **Attention on Stale Mower Data**: After the daily check has started, stale mower data with no confirmed mowing today becomes `MOWER_DATA_STALE`.
+- **Critical Robot Sensor State**: A robot can become `critical` even if `clock_time` continues to update, when actual mower data is stale.
+- **Regression Coverage**: Adds a test that ensures fresh clock/heartbeat does not mask stale mower status data.
 
 ## Improvements in version 0.5.7
 

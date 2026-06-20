@@ -4939,3 +4939,107 @@ async def test_v057_service_window_reconciliation_time_gate() -> None:
             datetime.datetime(2026, 6, 17, 12, 16, tzinfo=stockholm)
         )
         manager.async_run_morning_calendar_sync.assert_not_awaited()
+
+
+
+@pytest.mark.asyncio
+async def test_v058_mower_data_stale_requires_attention_after_daily_check() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+    )
+    from custom_components.automower_supervisor.models import RobotState
+
+    state = RobotState(robot_id="automowervv14big", display_name="Vv14 Big")
+    state.online = True
+    state.source_age_minutes = 0
+    state.mower_data_stale = True
+    state.mower_data_age_minutes = 240
+    state.current_status_plain = "Sleeping"
+    state.current_battery = 99
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = False
+
+    now = datetime.datetime(
+        2026, 6, 20, 12, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    result = evaluate_daily_attention(
+        state,
+        now,
+        observation_complete=True,
+    )
+
+    assert result.required is True
+    assert result.state == "needs_attention"
+    assert result.reason_codes == ["MOWER_DATA_STALE"]
+    assert "clock/heartbeat" in result.text
+    assert "mower-statusdata är gammal" in result.text
+
+
+
+@pytest.mark.asyncio
+async def test_v058_mower_data_stale_does_not_override_specific_attempt_result() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+    )
+    from custom_components.automower_supervisor.models import RobotState
+
+    state = RobotState(robot_id="automowertuv4", display_name="Tuv4")
+    state.online = True
+    state.source_age_minutes = 0
+    state.mower_data_stale = True
+    state.mower_data_age_minutes = 240
+    state.current_status_plain = "Sleeping"
+    state.current_battery = 100
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = True
+    state.last_mowing_attempt_result = "short_attempt"
+    state.last_mowing_attempt_duration_seconds = 44
+    state.last_mowing_ended_at = "2026-06-20T11:15:00+02:00"
+
+    now = datetime.datetime(
+        2026, 6, 20, 12, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    result = evaluate_daily_attention(
+        state,
+        now,
+        observation_complete=True,
+    )
+
+    assert result.required is True
+    assert result.reason_codes == ["ONLY_SHORT_ATTEMPT"]
+    assert "kort klippförsök" in result.text
+
+
+@pytest.mark.asyncio
+async def test_v058_mower_data_stale_requires_known_age() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+    )
+    from custom_components.automower_supervisor.models import RobotState
+
+    state = RobotState(robot_id="automowerkv5", display_name="Kv5")
+    state.online = True
+    state.source_age_minutes = 0
+    state.mower_data_stale = True
+    state.mower_data_age_minutes = None
+    state.current_status_plain = "Sleeping"
+    state.current_battery = 100
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = False
+
+    now = datetime.datetime(
+        2026, 6, 20, 12, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    result = evaluate_daily_attention(
+        state,
+        now,
+        observation_complete=True,
+    )
+
+    assert result.reason_codes != ["MOWER_DATA_STALE"]

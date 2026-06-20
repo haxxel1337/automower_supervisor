@@ -228,6 +228,31 @@ def evaluate_daily_attention(
             text=text,
         )
 
+    # Rule 4b: Robonect heartbeat is alive but mower data is stale
+    if (
+        state.mower_data_stale
+        and state.mower_data_age_minutes is not None
+        and not state.confirmed_mowing_today
+        and not state.mowing_attempted_today
+    ):
+        age_text = (
+            f"{state.mower_data_age_minutes} minuter"
+            if state.mower_data_age_minutes is not None
+            else "okänd tid"
+        )
+        text = (
+            f"{display_name}: Robonect svarar fortfarande via clock/heartbeat, "
+            f"men mower-statusdata är gammal ({age_text}). Ingen bekräftad "
+            f"klippning har registrerats idag. Aktuell status: {status_str}. "
+            f"{battery_str}. Kontrollera Robonect/robot."
+        )
+        return DailyAttentionResult(
+            required=True,
+            state="needs_attention",
+            reason_codes=["MOWER_DATA_STALE"],
+            text=text,
+        )
+
     # Rule 4: Aktiv klippsession
     if state.mowing_session_active:
         text = f"{display_name}: Klippsession pågår. Bekräftelse inväntas."
