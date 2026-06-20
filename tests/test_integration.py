@@ -5043,3 +5043,69 @@ async def test_v058_mower_data_stale_requires_known_age() -> None:
     )
 
     assert result.reason_codes != ["MOWER_DATA_STALE"]
+
+
+
+@pytest.mark.asyncio
+async def test_v059_late_start_kick_eligibility() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    hass.states.get = MagicMock(return_value=None)
+    manager = AutomowerSupervisorManager(hass)
+
+    state = manager.robots["automowervv14big"]
+    state.online = True
+    state.source_age_minutes = 0
+    state.mower_data_stale = False
+    state.current_error_active = False
+    state.binary_error = "off"
+    state.current_status_plain = "Sleeping"
+    state.confirmed_mowing_today = False
+    state.mowing_attempted_today = False
+    state.mowing_session_active = False
+    state.pending_mowing_confirmation = False
+
+    now = datetime.datetime(
+        2026, 6, 20, 11, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+
+    assert manager._late_start_kick_eligible(state, now) is True
+
+    state.mowing_attempted_today = True
+    assert manager._late_start_kick_eligible(state, now) is False
+
+
+@pytest.mark.asyncio
+async def test_v059_late_start_kick_window() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.manager import AutomowerSupervisorManager
+
+    hass = MagicMock()
+    hass.states.get = MagicMock(return_value=None)
+    manager = AutomowerSupervisorManager(hass)
+
+    state = manager.robots["automowervv14big"]
+    state.online = True
+    state.source_age_minutes = 0
+    state.mower_data_stale = False
+    state.current_error_active = False
+    state.binary_error = "off"
+    state.current_status_plain = "Sleeping"
+
+    before = datetime.datetime(
+        2026, 6, 20, 11, 4, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    inside = datetime.datetime(
+        2026, 6, 20, 11, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    after = datetime.datetime(
+        2026, 6, 20, 11, 15, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+
+    assert manager._late_start_kick_eligible(state, before) is False
+    assert manager._late_start_kick_eligible(state, inside) is True
+    assert manager._late_start_kick_eligible(state, after) is False

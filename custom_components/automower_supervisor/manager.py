@@ -33,6 +33,11 @@ from .const import (
     AUTO_RESET_LATCH_MINUTES,
     AUTO_RESET_STEP_DELAY_SECONDS,
     MOWER_DATA_STALE_MINUTES,
+    LATE_START_CHECK_HOUR,
+    LATE_START_CHECK_MINUTE,
+    LATE_START_WINDOW_MINUTES,
+    LATE_START_AUTO_WAIT_SECONDS,
+    LATE_START_ROBOT_GAP_SECONDS,
 )
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
@@ -160,6 +165,7 @@ class AutomowerSupervisorManager:
         self._robot_command_lock = asyncio.Lock()
         self._morning_wakeup_task: asyncio.Task | None = None
         self._auto_reset_tasks: dict[str, asyncio.Task] = {}
+        self._late_start_tasks: dict[str, asyncio.Task] = {}
         self._unsub_calendar_timers: list[Callable[[], None]] = []
         
         # Initialize the state representation for all robots
@@ -938,6 +944,101 @@ class AutomowerSupervisorManager:
         self._auto_reset_tasks[robot_id] = task
         return True
 
+    def _late_start_check_window_active(self, now: datetime) -> bool:
+        # Return True during the late scheduled-start check window.
+        from .calendar_sync import get_stockholm_timezone
+
+        local_now = now.astimezone(get_stockholm_timezone())
+        minutes = local_now.hour * 60 + local_now.minute
+        start = LATE_START_CHECK_HOUR * 60 + LATE_START_CHECK_MINUTE
+        return start <= minutes < start + LATE_START_WINDOW_MINUTES
+
+    def _late_start_kick_eligible(self, state: RobotState, now: datetime) -> bool:
+        # Return whether a robot should receive AUTO -> START after schedule start.
+        if not self._late_start_check_window_active(now):
+            return False
+
+        local_date = get_daily_date(now)
+        if state.late_start_attempted_date == local_date:
+            return False
+        if state.online is not True:
+            return False
+        if state.source_age_minutes is None or state.source_age_minutes > 15:
+            return False
+        if getattr(state, "mower_data_stale", False):
+            return False
+        if state.current_error_active or state.binary_error == "on":
+            return False
+        if state.recovery_state in (
+            RecoveryState.ACTIVE_ERROR,
+            RecoveryState.CLEARED_BUT_UNVERIFIED,
+        ):
+            return False
+        if state.failed_recovery:
+            return False
+        if state.confirmed_mowing_today or state.mowing_attempted_today:
+            return False
+        if state.mowing_session_active or state.pending_mowing_confirmation:
+            return False
+        return self._resting_status(state)
+
+    async def _async_run_late_start_kick(self, robot_id: str, now: datetime) -> None:
+        # Send AUTO then START to one healthy resting robot after schedule start.
+        state = self.robots[robot_id]
+        local_date = get_daily_date(now)
+        buttons = self._robonect_button_ids(robot_id)
+
+        async with self._robot_command_lock:
+            if not self._late_start_kick_eligible(state, dt_util.now()):
+                return
+
+            state.late_start_attempted_date = local_date
+            state.late_start_attempted_at = dt_util.as_utc(now).isoformat()
+            state.late_start_stage = "auto"
+            state.late_start_result = "in_progress"
+            await self._storage.async_save(self.get_storage_data())
+            self._notify_callbacks()
+
+            try:
+                await self._async_press_robonect_button(buttons["auto"])
+                await asyncio.sleep(LATE_START_AUTO_WAIT_SECONDS)
+
+                self.sync_initial_states(is_startup=False)
+                if self._resting_status(state) and not state.mowing_attempted_today:
+                    state.late_start_stage = "start"
+                    await self._async_press_robonect_button(buttons["start"])
+                    state.late_start_result = "auto_start_sent"
+                else:
+                    state.late_start_result = "auto_was_sufficient"
+
+                state.late_start_stage = "complete"
+            except Exception as err:
+                _LOGGER.error(
+                    "Late start kick failed for %s at %s: %s",
+                    robot_id,
+                    state.late_start_stage,
+                    err,
+                )
+                state.late_start_result = f"command_error: {err}"
+            finally:
+                await self._storage.async_save(self.get_storage_data())
+                self._notify_callbacks()
+
+            await asyncio.sleep(LATE_START_ROBOT_GAP_SECONDS)
+
+    def _schedule_late_start_kick_if_needed(self, robot_id: str, now: datetime) -> bool:
+        # Schedule one late start task without blocking the watchdog.
+        state = self.robots[robot_id]
+        task = self._late_start_tasks.get(robot_id)
+        if task is not None and not task.done():
+            return False
+        if not self._late_start_kick_eligible(state, now):
+            return False
+
+        task = self.hass.async_create_task(self._async_run_late_start_kick(robot_id, now))
+        self._late_start_tasks[robot_id] = task
+        return True
+
     async def _async_service_window_reconciliation_tick(self, now: datetime) -> None:
         """Reconcile calendar every five minutes from 11:20 through 12:15."""
         from .calendar_sync import get_stockholm_timezone, is_service_day
@@ -994,6 +1095,11 @@ class AutomowerSupervisorManager:
             if not task.done():
                 task.cancel()
         self._auto_reset_tasks.clear()
+
+        for task in self._late_start_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._late_start_tasks.clear()
 
         # Unsubscribe calendar timers
         for unsub in self._unsub_calendar_timers:
@@ -1180,6 +1286,8 @@ class AutomowerSupervisorManager:
                     storage_changed = True
 
             if self._schedule_latched_error_reset_if_needed(robot_id, now):
+                storage_changed = True
+            if self._schedule_late_start_kick_if_needed(robot_id, now):
                 storage_changed = True
             
         if storage_changed:

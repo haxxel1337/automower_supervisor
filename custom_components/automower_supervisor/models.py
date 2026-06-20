@@ -135,6 +135,12 @@ class RobotState:
     auto_reset_stage: str | None = None
     auto_reset_in_progress: bool = False
 
+    # Late scheduled-start kick diagnostics (Persisted)
+    late_start_attempted_date: str | None = None
+    late_start_attempted_at: str | None = None
+    late_start_result: str | None = None
+    late_start_stage: str | None = None
+
     # Charging trend monitoring (Persisted)
     charging_started_at: str | None = None
     charging_last_sample_at: str | None = None

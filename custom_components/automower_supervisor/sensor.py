@@ -385,6 +385,11 @@ class AutomowerRobotSensor(SensorEntity):
             "morning_wakeup_attempted_at": state_data.morning_wakeup_attempted_at,
             "morning_wakeup_result": state_data.morning_wakeup_result,
             "morning_wakeup_stage": state_data.morning_wakeup_stage,
+            # Late scheduled-start kick
+            "late_start_attempted_date": state_data.late_start_attempted_date,
+            "late_start_attempted_at": state_data.late_start_attempted_at,
+            "late_start_result": state_data.late_start_result,
+            "late_start_stage": state_data.late_start_stage,
             # Safe Robonect latched-error recovery
             "auto_reset_attempted_at": state_data.auto_reset_attempted_at,
             "auto_reset_incident_at": state_data.auto_reset_incident_at,
