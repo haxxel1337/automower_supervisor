@@ -1,0 +1,9 @@
+sync_calendar:
+  name: Sync calendar
+  description: Run Automower Supervisor calendar synchronization manually.
+  fields: {}
+
+delete_managed_calendar_event:
+  name: Delete managed calendar event
+  description: Delete the currently managed Automower Supervisor calendar event.
+  fields: {}
