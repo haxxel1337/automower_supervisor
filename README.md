@@ -1,6 +1,12 @@
-# Automower Supervisor v0.5.9
+# Automower Supervisor v0.5.10
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.5.10
+
+- **Service Descriptions**: Adds `services.yaml` for the integration services registered by Automower Supervisor.
+- **Cleaner Home Assistant Logs**: Prevents Home Assistant from logging `Failed to load services.yaml for integration: automower_supervisor` when loading service metadata.
+- **No Logic Change**: The mower supervision, 08:45 AUTO check, 11:05 late start kick, calendar sync, and stale-data detection remain unchanged from v0.5.9.
 
 ## Improvements in version 0.5.9
 
