@@ -101,16 +101,31 @@ class AutomowerRobotSensor(SensorEntity):
         now = dt_util.now()
         attempt_is_today = is_attempt_from_today(state_data, now)
 
+        status_norm = (
+            state_data.current_status_plain or state_data.current_status or ""
+        ).strip().lower()
+        recovery_mowing_in_progress = (
+            state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+            and (state_data.mowing_session_active or status_norm == "mowing")
+        )
+
         # 1. Critical state (active error or cleared but unverified or failed recovery or offline)
         is_critical = (
             state_data.current_error_active
             or state_data.binary_error == "on"
-            or state_data.recovery_state in (RecoveryState.ACTIVE_ERROR, RecoveryState.CLEARED_BUT_UNVERIFIED)
+            or state_data.recovery_state == RecoveryState.ACTIVE_ERROR
+            or (
+                state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+                and not recovery_mowing_in_progress
+            )
             or state_data.failed_recovery
             or state_data.online is False
         )
         if is_critical:
             return "critical"
+
+        if recovery_mowing_in_progress:
+            return "warning"
 
         # 2. Warning when Charging is reported but battery decreases
         if state_data.charging_stalled:
@@ -204,8 +219,19 @@ class AutomowerRobotSensor(SensorEntity):
             reasons.append("ACTIVE_ERROR_MESSAGE")
         if state_data.binary_error == "on":
             reasons.append("BINARY_ERROR_ON")
+        status_norm = (
+            state_data.current_status_plain or state_data.current_status or ""
+        ).strip().lower()
+        recovery_mowing_in_progress = (
+            state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED
+            and (state_data.mowing_session_active or status_norm == "mowing")
+        )
+
         if state_data.recovery_state == RecoveryState.CLEARED_BUT_UNVERIFIED:
-            reasons.append("CLEARED_BUT_UNVERIFIED")
+            if recovery_mowing_in_progress:
+                reasons.append("RECOVERY_MOWING_IN_PROGRESS")
+            else:
+                reasons.append("CLEARED_BUT_UNVERIFIED")
 
         if state_data.charging_stalled:
             reasons.append("CHARGING_STALLED")

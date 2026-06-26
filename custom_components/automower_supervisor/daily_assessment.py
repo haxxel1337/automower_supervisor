@@ -146,6 +146,28 @@ def evaluate_daily_attention(
     is_failed_recovery = state.failed_recovery
 
     if is_active_error or is_cleared_unverified or is_failed_recovery:
+        status_norm = (status_str or "").strip().lower()
+        recovery_mowing_in_progress = (
+            is_cleared_unverified
+            and not is_active_error
+            and not is_failed_recovery
+            and (state.mowing_session_active or status_norm == "mowing")
+        )
+
+        if recovery_mowing_in_progress:
+            text = (
+                f"{display_name}: Tidigare fel \"{error_msg}\" är nollställt "
+                f"och klippning pågår. Verifiering sker när klippsessionen "
+                f"avslutas. Aktuell status: {status_str}. {battery_str}. "
+                f"{online_suffix}"
+            )
+            return DailyAttentionResult(
+                required=False,
+                state="monitoring",
+                reason_codes=["RECOVERY_MOWING_IN_PROGRESS"],
+                text=text,
+            )
+
         if is_active_error:
             code = "ACTIVE_ERROR"
             text = (

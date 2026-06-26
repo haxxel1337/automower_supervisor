@@ -5109,3 +5109,74 @@ async def test_v059_late_start_kick_window() -> None:
     assert manager._late_start_kick_eligible(state, before) is False
     assert manager._late_start_kick_eligible(state, inside) is True
     assert manager._late_start_kick_eligible(state, after) is False
+
+
+
+@pytest.mark.asyncio
+async def test_v0511_recovery_mowing_in_progress_is_monitoring() -> None:
+    import datetime
+
+    from custom_components.automower_supervisor.daily_assessment import (
+        evaluate_daily_attention,
+    )
+    from custom_components.automower_supervisor.models import (
+        RecoveryState,
+        RobotState,
+    )
+
+    state = RobotState(robot_id="automoweralmv3", display_name="Almv3")
+    state.online = True
+    state.current_status_plain = "Mowing"
+    state.current_battery = 87
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error = "Charging station blocked"
+    state.mowing_session_active = True
+
+    now = datetime.datetime(
+        2026, 6, 26, 11, 45, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+    )
+    result = evaluate_daily_attention(
+        state,
+        now,
+        observation_complete=True,
+    )
+
+    assert result.required is False
+    assert result.state == "monitoring"
+    assert result.reason_codes == ["RECOVERY_MOWING_IN_PROGRESS"]
+    assert "klippning pågår" in result.text
+    assert "Verifiering sker när klippsessionen avslutas" in result.text
+
+
+@pytest.mark.asyncio
+async def test_v0511_robot_sensor_recovery_mowing_is_not_critical() -> None:
+    from unittest.mock import MagicMock
+
+    from custom_components.automower_supervisor.manager import (
+        AutomowerSupervisorManager,
+    )
+    from custom_components.automower_supervisor.models import RecoveryState
+    from custom_components.automower_supervisor.sensor import AutomowerRobotSensor
+
+    hass = MagicMock()
+    hass.states.get = MagicMock(return_value=None)
+    manager = AutomowerSupervisorManager(hass)
+
+    robot_id = "automoweralmv3"
+    state = manager.robots[robot_id]
+    state.online = True
+    state.source_age_minutes = 0
+    state.current_status_plain = "Mowing"
+    state.current_battery = 59
+    state.binary_error = "off"
+    state.current_error_active = False
+    state.recovery_state = RecoveryState.CLEARED_BUT_UNVERIFIED
+    state.last_real_error = "Charging station blocked"
+    state.mowing_session_active = True
+
+    sensor = AutomowerRobotSensor(robot_id, manager)
+    attrs = sensor.extra_state_attributes
+
+    assert sensor.native_value == "warning"
+    assert "RECOVERY_MOWING_IN_PROGRESS" in attrs["assessment_reasons"]
+    assert "CLEARED_BUT_UNVERIFIED" not in attrs["assessment_reasons"]
