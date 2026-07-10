@@ -1,8 +1,4 @@
-"""Compatibility and behavior patch for Automower Supervisor v0.5.12.
-
-This module is intentionally small and self-contained so it can be installed early
-from __init__.py without rewriting the existing manager module.
-"""
+"""Compatibility and behavior patch for Automower Supervisor v0.5.12."""
 
 from __future__ import annotations
 
@@ -38,6 +34,10 @@ def _is_error_value(value: Any) -> bool:
     return bool(norm and norm not in NO_ACTIVE_ERROR_VALUES)
 
 
+def _error_code_entity_id(robot_id: str) -> str:
+    return f"sensor.{robot_id}_mower_error_code"
+
+
 def _ensure_state_attrs(state: Any) -> None:
     defaults = {
         "current_error_code": None,
@@ -71,22 +71,18 @@ def _stale_error_clear_evidence(state: Any) -> bool:
         return False
 
     error_text = _norm(state.current_error_message)
-
-    battery_empty_contradiction = (
+    if (
         "battery" in error_text
         and "empty" in error_text
         and state.current_battery is not None
         and state.current_battery >= 20
-    )
-    if battery_empty_contradiction:
+    ):
         return True
 
     if getattr(state, "confirmed_mowing_today", False):
         return True
-
     if _iso_after(getattr(state, "last_confirmed_mowing_at", None), getattr(state, "last_real_error_at", None)):
         return True
-
     if _iso_after(getattr(state, "last_mowing_attempt_at", None), getattr(state, "last_real_error_at", None)):
         return True
 
@@ -99,14 +95,8 @@ def install() -> None:
     if _INSTALLED:
         return
 
-    from . import const
     from . import manager as manager_mod
     from . import sensor as sensor_mod
-
-    const.ENTITY_PATTERNS.setdefault(
-        "error_code",
-        "sensor.{robot}_mower_error_code",
-    )
 
     Manager = manager_mod.AutomowerSupervisorManager
     if getattr(Manager, "_v0512_stale_error_code_patch", False):
@@ -118,8 +108,9 @@ def install() -> None:
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self._stale_error_code_tasks: dict[str, asyncio.Task] = {}
-        for state in self.robots.values():
+        for robot_id, state in self.robots.items():
             _ensure_state_attrs(state)
+            self._entity_lookup[_error_code_entity_id(robot_id)] = (robot_id, "error_code")
 
     Manager.__init__ = patched_init
 
@@ -204,6 +195,28 @@ def install() -> None:
 
     Manager._update_robot_error_state = patched_update_robot_error_state
 
+    original_sync_initial_states = Manager.sync_initial_states
+
+    def patched_sync_initial_states(self, *args, **kwargs) -> bool:
+        changed = original_sync_initial_states(self, *args, **kwargs)
+        current_time_iso = dt_util.now().isoformat()
+
+        for robot_id, state in self.robots.items():
+            _ensure_state_attrs(state)
+            ha_state = self.hass.states.get(_error_code_entity_id(robot_id))
+            if ha_state is None:
+                continue
+            if ha_state.state in ("unknown", "unavailable"):
+                continue
+            if self._update_state_field(state, "error_code", ha_state.state):
+                changed = True
+            if self._update_robot_error_state(robot_id, current_time_iso):
+                changed = True
+
+        return changed
+
+    Manager.sync_initial_states = patched_sync_initial_states
+
     original_buttons = Manager._robonect_button_ids
 
     def patched_robonect_button_ids(robot_id: str) -> dict[str, str]:
@@ -249,9 +262,7 @@ def install() -> None:
 
         try:
             incident_dt = datetime.fromisoformat(incident_at)
-            age = (
-                dt_util.as_utc(now) - dt_util.as_utc(incident_dt)
-            ).total_seconds()
+            age = (dt_util.as_utc(now) - dt_util.as_utc(incident_dt)).total_seconds()
         except (TypeError, ValueError):
             return False
 
