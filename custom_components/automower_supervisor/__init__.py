@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
+from . import compat_0512
 from .manager import AutomowerSupervisorManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,6 +22,9 @@ PLATFORMS = [Platform.SENSOR]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[AutomowerSupervisorManager]) -> bool:
     """Set up Automower Supervisor from a config entry."""
     _LOGGER.info("Setting up Automower Supervisor entry: %s", entry.entry_id)
+
+    # Install compatibility/behavior patches before the manager builds entity IDs.
+    compat_0512.install()
 
     # Initialize the central manager
     manager = AutomowerSupervisorManager(hass)
