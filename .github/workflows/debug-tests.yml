@@ -1,0 +1,23 @@
+name: Debug Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  debug-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone and run compact tests
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch fix/ci-pr-test https://github.com/haxxel1337/automower_supervisor.git repo
+          cd repo
+          python3 --version
+          python3 -m pip install --upgrade pip >/dev/null
+          python3 -m pip install pytest pytest-asyncio voluptuous >/dev/null
+          python3 -m compileall -q custom_components/automower_supervisor
+          python3 -m pytest -q --tb=short
