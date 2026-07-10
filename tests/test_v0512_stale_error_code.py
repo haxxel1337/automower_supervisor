@@ -22,13 +22,15 @@ def _manager() -> AutomowerSupervisorManager:
 
 
 @pytest.mark.asyncio
-async def test_v0512_error_code_entity_pattern_is_added() -> None:
+async def test_v0512_error_code_entity_is_listened_to_without_discovery_counting() -> None:
     manager = _manager()
-
     state = manager.robots["automowertrv4"]
 
-    assert "error_code" in state.entity_ids
-    assert state.entity_ids["error_code"] == "sensor.automowertrv4_mower_error_code"
+    assert "error_code" not in state.entity_ids
+    assert manager._entity_lookup["sensor.automowertrv4_mower_error_code"] == (
+        "automowertrv4",
+        "error_code",
+    )
 
 
 @pytest.mark.asyncio
