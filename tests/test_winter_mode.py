@@ -35,6 +35,7 @@ def fixed_time():
 def make_manager() -> AutomowerSupervisorManager:
     hass = MagicMock()
     hass.data = {}
+    hass.is_running = True
     hass._mock_time_callbacks = []
     hass._mock_time_change_callbacks = []
     hass.config_entries.async_entries.return_value = []

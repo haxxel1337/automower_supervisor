@@ -62,6 +62,8 @@ class AutomowerWinterModeSwitch(SwitchEntity):
                 for robot_id, result in self.manager.winter_parking_results.items()
             },
             "storage_error": self.manager.winter_storage_error,
+            "calendar_cleanup": dict(self.manager.winter_calendar_cleanup),
+            "calendar_cleanup_in_progress": self.manager.winter_calendar_cleanup_in_progress,
             "parking_note": "HOME requests do not confirm physical arrival at the dock.",
         }
 
