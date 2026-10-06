@@ -89,6 +89,7 @@ class WinterModeMixin(WinterCalendarMixin):
             "resume_date": self._winter_resume_date,
             "parking_results": {key: dict(value) for key, value in self.winter_parking_results.items()},
             "calendar_cleanup": dict(self.winter_calendar_cleanup),
+            "calendar_log": [dict(record) for record in self.winter_calendar_log],
         }
 
     def _load_winter_state(self, data):
@@ -120,6 +121,7 @@ class WinterModeMixin(WinterCalendarMixin):
             self._winter_resume_date = resume_date
             self.winter_parking_results = {key: dict(value) for key, value in results.items()}
             changed = self._load_winter_calendar(winter)
+            changed = self._load_winter_calendar_log(winter) or changed
             for result in self.winter_parking_results.values():
                 if result["status"] in {"pending", "requesting"}:
                     result["status"] = "unverified"
@@ -140,8 +142,10 @@ class WinterModeMixin(WinterCalendarMixin):
         tasks.add(getattr(self, "_morning_wakeup_task", None))
         if include_parking:
             self._cancel_winter_calendar_startup()
+            self._cancel_winter_calendar_log_startup()
             tasks.add(self._winter_parking_task)
             tasks.add(self._winter_calendar_task)
+            tasks.add(self._winter_calendar_log_task)
             tasks.update(self._winter_request_tasks)
         tasks = {task for task in tasks if task is not None and task is not current and not task.done()}
         for task in tasks:
@@ -158,6 +162,7 @@ class WinterModeMixin(WinterCalendarMixin):
             self.winter_parking_in_progress = False
         if include_parking:
             self.winter_calendar_cleanup_in_progress = False
+            self.winter_calendar_log_in_progress = False
 
     async def _async_save_winter(self):
         try:
@@ -177,11 +182,14 @@ class WinterModeMixin(WinterCalendarMixin):
                     await self._async_save_winter()
                 if enabled:
                     self._schedule_winter_calendar_cleanup()
+                self._schedule_winter_calendar_log()
                 return
             self._supervisor_generation += 1
+            changed_at = dt_util.as_utc(dt_util.now()).isoformat()
             if enabled:
                 self.winter_mode = True
-                self.winter_mode_changed_at = dt_util.as_utc(dt_util.now()).isoformat()
+                self.winter_mode_changed_at = changed_at
+                self._append_winter_calendar_log(True, changed_at)
                 self.setup_calendar_timers()
                 self._prepare_winter_parking()
                 self._prepare_winter_calendar()
@@ -198,8 +206,9 @@ class WinterModeMixin(WinterCalendarMixin):
                 await self._async_cancel_supervisor_work()
                 old_changed_at = self.winter_mode_changed_at
                 old_resume_date = self._winter_resume_date
-                self.winter_mode_changed_at = dt_util.as_utc(dt_util.now()).isoformat()
+                self.winter_mode_changed_at = changed_at
                 self._winter_resume_date = get_daily_date(dt_util.now())
+                off_record = self._append_winter_calendar_log(False, changed_at)
                 # Include discarded verification state in the same durable OFF
                 # transition: a restart must not count winter odometry as recovery.
                 for state in self.robots.values():
@@ -217,6 +226,7 @@ class WinterModeMixin(WinterCalendarMixin):
                 except Exception as err:
                     self.winter_mode_changed_at = old_changed_at
                     self._winter_resume_date = old_resume_date
+                    self.winter_calendar_log.remove(off_record)
                     self.winter_storage_error = str(err)
                     self._notify_callbacks()
                     raise
@@ -228,6 +238,7 @@ class WinterModeMixin(WinterCalendarMixin):
                     self._update_watchdog_for_robot(robot_id, now)
                 self.evaluate_all_daily_attention(now)
                 self.setup_calendar_timers()
+            self._schedule_winter_calendar_log()
             self._notify_callbacks()
 
     def _prepare_winter_parking(self):

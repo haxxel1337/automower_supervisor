@@ -1,6 +1,14 @@
-# Automower Supervisor v0.6.1
+# Automower Supervisor v0.6.2
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.6.2
+
+- **Winter transition log**: Each actual switch transition creates one timed calendar appointment titled `BOTS WINTER MODE ON` or `BOTS WINTER MODE OFF`, at the saved transition time. The appointment lasts one minute.
+- **Restart-safe logging**: A durable unique marker and creation intent prevent repeated switch calls, integration reloads, and HA restarts from producing additional entries. Pending changes retain their original timestamps. The calendar is checked before creation; after a lost response or an interrupted creation, startup/retry only reconciles the existing entry and never blindly repeats the create request.
+- **Existing winter installations**: Upgrading from v0.6.0/0.6.1 while already ON records the saved activation time once, when available. It does not invent a new activation at startup or repeat parking.
+- **Separate calendar history**: Winter ON/OFF log entries are preserved when Supervisor service appointments are removed. Cleanup identifies the maintenance marker, and the log uses its own marker namespace.
+- **Spring plan recorded**: README retains the two-attempt recovery budget and iPhone notification requirements below. Movement recovery and push notifications are roadmap work, not enabled features in this release.
 
 ## Improvements in version 0.6.1
 
@@ -18,13 +26,15 @@ Automower Supervisor is a local Home Assistant custom integration that aggregate
 
 ## Using Winter Mode
 
-Update Automower Supervisor to **v0.6.1** in HACS and restart Home Assistant. Open **Settings → Devices & services → Automower Supervisor → the central Automower Supervisor device**. **WINTER MODE**, **Retry winter parking**, and **Retry winter calendar cleanup** appear under configuration controls. Existing installations start with Winter Mode off unless it was already enabled; enable it explicitly when ready.
+Update Automower Supervisor to **v0.6.2** in HACS and restart Home Assistant. Open **Settings → Devices & services → Automower Supervisor → the central Automower Supervisor device**. **WINTER MODE**, **Retry winter parking**, **Retry winter calendar cleanup**, and **Retry winter calendar log** appear under configuration controls. Existing installations start with Winter Mode off unless it was already enabled; enable it explicitly when ready.
 
 Enable `WINTER MODE` (`switch.automower_supervisor_winter_mode`) on the central Supervisor device before putting the fleet away. The switch pauses Supervisor even when parking is incomplete; check the per-mower result attributes and use **Retry winter parking** (`button.automower_supervisor_retry_winter_parking`) after an offline mower becomes reachable. The retry button is available while Winter Mode is on and no parking pass is running. A completed docking service call does not verify physical arrival at the charging station. Stopped or faulted mowers may need on-site assistance: parking requests `HOME` only, without `START` or error reset.
 
-Parking and removal of Supervisor-marked appointments are the intended actions while Winter Mode is enabled. Supervisor's normal wake-up, error-recovery, activity monitoring, and calendar creation workflows remain paused. Restarting Home Assistant restores the winter state; it does not resume mowing. Cleanup uses the exact `[AUTOMOWER_SUPERVISOR:v1:YYYY-MM-DD]` description marker, not the event title. It checks yesterday through the next seven days plus cached event/snapshot dates, preserves unmarked or recurring appointments, and reports an error if deletion is unsupported or an owned event has no UID. A calendar retry does not send mower commands.
+Parking, removal of Supervisor service appointments, and transition logging are the intended actions while Winter Mode is enabled. Supervisor's normal wake-up, error-recovery, activity monitoring, and service-calendar creation workflows remain paused. Restarting Home Assistant restores the winter state; it does not resume mowing. Cleanup uses the exact `[AUTOMOWER_SUPERVISOR:v1:YYYY-MM-DD]` description marker, not the event title. It checks yesterday through the next seven days plus cached event/snapshot dates, preserves unmarked or recurring appointments, and reports an error if deletion is unsupported or an owned event has no UID. Calendar retries do not send mower commands.
 
-If you already enabled Winter Mode in v0.6.0 and disabled Supervisor, temporarily re-enable **Supervisor** after updating to v0.6.1 so it can perform calendar cleanup. **Robonect can remain disabled** for this cleanup. Verify `calendar_cleanup.status` is `deleted` or `no_events` before disabling Supervisor for winter; a disabled integration cannot perform cleanup.
+If you already enabled Winter Mode and disabled Supervisor, temporarily re-enable **Supervisor** after updating so it can perform calendar cleanup and write the ON log. **Robonect can remain disabled** for these calendar actions. Verify `calendar_cleanup.status` is `deleted` or `no_events`, and the latest `calendar_log` record is `created`, before disabling Supervisor for winter; a disabled integration cannot perform calendar actions.
+
+The configured calendar receives `BOTS WINTER MODE ON` and `BOTS WINTER MODE OFF` at actual switch-change times. Repeating ON while already ON, or OFF while already OFF, adds nothing. The switch and Summary expose pending/completed log records and `calendar_log_in_progress`. If the calendar was unavailable before creation, **Retry winter calendar log** can send the pending entry at its original time. If a creation outcome is `uncertain`, retry only checks for the unique marker: inspect the calendar and error attribute rather than repeatedly creating an entry. The ON/OFF history is retained during service-appointment cleanup.
 
 Winter Mode controls this integration. It does not disable unrelated Home Assistant automations, manual controls, or Robonect itself. A storage failure leaves Supervisor paused and exposes `storage_error`; no parking is started until the pause is saved. If storage could not be read, repair the storage problem and reload the integration before changing Winter Mode.
 
@@ -32,7 +42,7 @@ In spring, turn Winter Mode off to resume Supervisor. Switching off itself sends
 
 ## Spring roadmap: manual maneuvers and recovery
 
-Movement-based recovery is **not implemented in v0.6.0**. The profiles and observations below preserve the manual experiments for future development; they are not automatic recovery defaults or permission to drive through an active safety fault.
+Movement-based recovery and iPhone failure notifications are **not implemented in v0.6.2**. The profiles and observations below preserve the manual experiments for future development; they are not automatic recovery defaults or permission to drive through an active safety fault.
 
 ### Recorded manual test profiles
 
@@ -76,7 +86,15 @@ The user reported an unsuccessful attempt followed by a retry and suspected Wi-F
 - **Persistent attempt budget**: Save incident/day attempt limits and cooldowns before motion. Restarts must preserve the budget and must never resume an interrupted movement sequence.
 - **Separate outcome verification**: Record maneuver success separately from recovery. Exclude escape distance from mowing/recovery evidence, establish a fresh baseline after verified stop, and confirm normal work independently.
 
-Start with supervised manual operation and simulated-transport tests. Automatic recovery remains deferred until each permitted fault/profile combination and the installed mower firmware have been verified.
+### Spring 2027: two recovery attempts, then an iPhone notification
+
+The requested policy is a **maximum of two validated recovery attempts per robot and incident**. Select Back, Rotation, or Forward and any RESET/AUTO/START combination according to the actual error code and fresh robot state; validate the sequence before allowing automatic operation. After each attempt, independently verify that normal operation resumed. Stop as soon as recovery succeeds.
+
+Persist the attempt count, incident ID, attempted profiles, outcomes, and cooldowns before commanding movement. The two-attempt budget must be shared across `direct` and related RESET/AUTO/START recovery flows. A Home Assistant restart must not reset the budget or replay a maneuver. An ambiguous `direct` result must be reconciled instead of automatically repeating movement. Active safety faults remain ineligible for automatic driving and require intervention.
+
+After two unsuccessful eligible attempts, send **one failure notification to the user's iPhone** for that incident and stop automatic recovery. Include robot name, current error code and text, the two attempted sequences and their outcomes, last known status/connectivity, and a link to the robot in HA. Avoid repeating the notification on every watchdog tick; record notification state per incident. Use the user's actual `notify.mobile_app_<iphone_device_id>` action, to be identified and tested when implementation resumes, following the [Home Assistant Companion notification documentation](https://companion.home-assistant.io/docs/notifications/notifications-basic/).
+
+Start with supervised manual operation and simulated-transport tests. Automatic recovery and iPhone notification delivery remain deferred until spring implementation and verification.
 
 ## Improvements in version 0.5.12
 
