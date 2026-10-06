@@ -22,6 +22,7 @@ async def async_setup_entry(
     async_add_entities([
         AutomowerWinterParkingButton(entry.runtime_data),
         AutomowerWinterCalendarCleanupButton(entry.runtime_data),
+        AutomowerWinterCalendarLogButton(entry.runtime_data),
     ])
 
 
@@ -74,3 +75,26 @@ class AutomowerWinterCalendarCleanupButton(AutomowerWinterParkingButton):
 
     async def async_press(self) -> None:
         await self.manager.async_retry_winter_calendar_cleanup()
+
+
+class AutomowerWinterCalendarLogButton(AutomowerWinterParkingButton):
+    """Retry unsent logs or reconcile an uncertain create without another create."""
+
+    _attr_name = "Retry winter calendar log"
+    _attr_icon = "mdi:calendar-edit"
+
+    def __init__(self, manager: AutomowerSupervisorManager) -> None:
+        super().__init__(manager)
+        self.entity_id = "button.automower_supervisor_retry_winter_calendar_log"
+        self._attr_unique_id = "automower_supervisor_retry_winter_calendar_log"
+
+    @property
+    def available(self) -> bool:
+        return (
+            bool(self.manager.calendar_entity_id)
+            and not self.manager.winter_calendar_log_in_progress
+            and any(record["status"] != "created" for record in self.manager.winter_calendar_log)
+        )
+
+    async def async_press(self) -> None:
+        await self.manager.async_retry_winter_calendar_log()

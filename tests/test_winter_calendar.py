@@ -24,6 +24,8 @@ def event(uid="owned", day="2026-10-07", *, marked=True, title="Bot Kv5, Vv14 Mi
 
 def calendar_manager(events=None):
     manager = make_manager()
+    # These tests isolate deletion. The transition log has its own test module.
+    manager._schedule_winter_calendar_log = MagicMock()
     manager.hass.config_entries.async_entries.return_value = [SimpleNamespace(options={
         "calendar_enabled": True, "calendar_entity_id": "calendar.garden",
     })]

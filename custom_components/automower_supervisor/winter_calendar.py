@@ -10,15 +10,17 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 import homeassistant.util.dt as dt_util
 
 from .calendar_sync import get_stockholm_timezone
+from .winter_calendar_log import WinterCalendarLogMixin
 
 _LOGGER = logging.getLogger(__name__)
 _FINISHED = {"deleted", "no_events", "not_configured"}
 
 
-class WinterCalendarMixin:
+class WinterCalendarMixin(WinterCalendarLogMixin):
     """An explicit, bounded exception to the normal winter calendar pause."""
 
     def _init_winter_calendar(self):
+        self._init_winter_calendar_log()
         self.winter_calendar_cleanup = {"status": "not_requested", "deleted_count": 0}
         self.winter_calendar_cleanup_in_progress = False
         self._winter_calendar_task = None

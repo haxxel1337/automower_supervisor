@@ -686,6 +686,8 @@ class AutomowerSupervisorSummarySensor(SensorEntity):
         attrs["winter_storage_error"] = self.manager.winter_storage_error
         attrs["winter_calendar_cleanup"] = dict(self.manager.winter_calendar_cleanup)
         attrs["winter_calendar_cleanup_in_progress"] = self.manager.winter_calendar_cleanup_in_progress
+        attrs["winter_calendar_log"] = [dict(record) for record in self.manager.winter_calendar_log]
+        attrs["winter_calendar_log_in_progress"] = self.manager.winter_calendar_log_in_progress
         
         # Add calendar sync attributes
         attrs["calendar_sync_enabled"] = self.manager.calendar_enabled and not self.manager.winter_mode

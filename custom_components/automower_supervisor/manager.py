@@ -206,6 +206,7 @@ class AutomowerSupervisorManager(WinterModeMixin):
             if storage_changed:
                 await self._storage.async_save(self.get_storage_data())
             self._schedule_winter_calendar_cleanup()
+            self._schedule_winter_calendar_log()
             return
         
         # Initial scan of current state machine states
@@ -251,6 +252,7 @@ class AutomowerSupervisorManager(WinterModeMixin):
         # Setup calendar timers, missed sync checks and services
         self.setup_calendar_timers()
         self.register_services()
+        self._schedule_winter_calendar_log()
         await self.async_check_missed_syncs()
 
     async def _async_load_storage(self) -> bool:
