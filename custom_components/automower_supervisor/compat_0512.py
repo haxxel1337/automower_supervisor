@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 import homeassistant.util.dt as dt_util
+from .winter import supervisor_operation
 
 RESET_WAIT_SECONDS = 15
 VERIFY_AFTER_RESET_SECONDS = 60
@@ -176,6 +177,8 @@ def install() -> None:
     original_update_error_state = Manager._update_robot_error_state
 
     def patched_update_robot_error_state(self, robot_id: str, current_time_iso: str) -> bool:
+        if not self._supervisor_running():
+            return False
         state = self.robots[robot_id]
         _ensure_state_attrs(state)
 
@@ -198,6 +201,8 @@ def install() -> None:
     original_sync_initial_states = Manager.sync_initial_states
 
     def patched_sync_initial_states(self, *args, **kwargs) -> bool:
+        if not self._supervisor_running():
+            return False
         changed = original_sync_initial_states(self, *args, **kwargs)
         current_time_iso = dt_util.now().isoformat()
 
@@ -227,6 +232,8 @@ def install() -> None:
     Manager._robonect_button_ids = staticmethod(patched_robonect_button_ids)
 
     def _stale_error_code_clear_eligible(self, state, now: datetime) -> bool:
+        if not self._supervisor_running() or self._winter_skip_catchup(now):
+            return False
         _ensure_state_attrs(state)
 
         if state.stale_error_fix_in_progress:
@@ -279,6 +286,7 @@ def install() -> None:
 
     Manager._refresh_robot_after_command = _refresh_robot_after_command
 
+    @supervisor_operation
     async def _async_run_stale_error_code_clear(self, robot_id: str, now: datetime) -> None:
         state = self.robots[robot_id]
         _ensure_state_attrs(state)
@@ -358,6 +366,7 @@ def install() -> None:
 
     original_watchdog = Manager._async_watchdog_check
 
+    @supervisor_operation
     async def patched_watchdog_check(self, now: datetime) -> None:
         await original_watchdog(self, now)
 

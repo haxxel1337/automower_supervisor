@@ -53,10 +53,14 @@ for mod_name in [
     "homeassistant.helpers.device_registry",
     "homeassistant.helpers.entity_platform",
     "homeassistant.helpers.selector",
+    "homeassistant.helpers.entity",
+    "homeassistant.exceptions",
     "homeassistant.components",
     "homeassistant.components.calendar",
     "homeassistant.components.calendar.const",
     "homeassistant.components.sensor",
+    "homeassistant.components.switch",
+    "homeassistant.components.button",
     "homeassistant.util",
     "homeassistant.util.dt",
     "homeassistant.data_entry_flow",
@@ -100,6 +104,23 @@ homeassistant.components.calendar.const.CalendarEntityFeature = (
 import homeassistant.const
 homeassistant.const.Platform = MagicMock()
 homeassistant.const.Platform.SENSOR = "sensor"
+homeassistant.const.Platform.SWITCH = "switch"
+homeassistant.const.Platform.BUTTON = "button"
+
+
+class MockHomeAssistantError(Exception):
+    """An error presented by Home Assistant to its user."""
+
+
+class MockConfigEntryNotReady(MockHomeAssistantError):
+    """Setup should be retried without starting automation."""
+
+
+sys.modules["homeassistant.exceptions"].HomeAssistantError = MockHomeAssistantError
+sys.modules["homeassistant.exceptions"].ConfigEntryNotReady = MockConfigEntryNotReady
+sys.modules["homeassistant.helpers.entity"].EntityCategory = MagicMock(CONFIG="config")
+sys.modules["homeassistant.components.switch"].SwitchEntity = MockEntity
+sys.modules["homeassistant.components.button"].ButtonEntity = MockEntity
 
 # Setup homeassistant.core
 import homeassistant.core
@@ -4339,6 +4360,13 @@ async def test_version_0_5_2_scenarios() -> None:
     # ----------------------------------------------------
     # Scenario 45 - Sync lock blocks concurrent runs
     # ----------------------------------------------------
+    # HA reload creates a new manager. The unloaded instance must stay invalid,
+    # including any service callback retained by an in-flight operation.
+    from copy import deepcopy
+    persisted_after_unload = deepcopy(manager._storage._store.data)
+    manager = AutomowerSupervisorManager(hass)
+    manager._storage._store.data = persisted_after_unload
+    mock_entry.runtime_data = manager
     await manager.async_setup()
     assert manager._calendar_sync_lock is not None
     
@@ -4826,9 +4854,9 @@ async def test_v057_targeted_morning_wakeup_sequence() -> None:
         await manager._async_run_targeted_morning_wakeup(now)
 
     assert hass.services.async_call.await_args_list == [
-        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=False),
-        call("button", "press", {"entity_id": "button.automowerkv5_start"}, blocking=False),
-        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=True),
+        call("button", "press", {"entity_id": "button.automowerkv5_start"}, blocking=True),
+        call("button", "press", {"entity_id": "button.automowerkv5_auto"}, blocking=True),
     ]
     assert state.morning_wakeup_result == "auto_start_auto_sent"
 
@@ -4895,10 +4923,10 @@ async def test_v057_latched_error_reset_sequence_and_idempotence() -> None:
         await manager._async_run_latched_error_reset("automowervv14big", now)
 
     assert hass.services.async_call.await_args_list == [
-        call("button", "press", {"entity_id": "button.automowervv14big_stop"}, blocking=False),
-        call("button", "press", {"entity_id": "button.automowervv14big_error_reset"}, blocking=False),
-        call("button", "press", {"entity_id": "button.automowervv14big_start"}, blocking=False),
-        call("button", "press", {"entity_id": "button.automowervv14big_auto"}, blocking=False),
+        call("button", "press", {"entity_id": "button.automowervv14big_stop"}, blocking=True),
+        call("button", "press", {"entity_id": "button.automowervv14big_error_reset"}, blocking=True),
+        call("button", "press", {"entity_id": "button.automowervv14big_start"}, blocking=True),
+        call("button", "press", {"entity_id": "button.automowervv14big_auto"}, blocking=True),
     ]
     assert state.auto_reset_result == "commands_sent_awaiting_verification"
 

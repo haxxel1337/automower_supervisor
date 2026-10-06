@@ -1,6 +1,74 @@
-# Automower Supervisor v0.5.12
+# Automower Supervisor v0.6.0
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.6.0
+
+- **Global Winter Mode**: Adds a `WINTER MODE` switch on the central Automower Supervisor device. Its state persists across integration reloads and Home Assistant restarts.
+- **Paused Supervision**: While enabled, Supervisor pauses health/activity assessments, automatic command sequences, and calendar synchronization. Robonect's own telemetry can still refresh; Supervisor's readings remain marked as paused/stale.
+- **Park All**: Turning Winter Mode on requests parking for every configured mower using `lawn_mower.dock`, which the Robonect integration maps to `HOME`.
+- **Visible Parking Results**: Offline mowers and failed parking requests remain listed for follow-up. Winter Mode stays on even if some mowers cannot be reached. Parking can be retried explicitly.
+- **Deliberate Spring Restart**: Turning Winter Mode off resumes supervision without sending a fleet-wide `AUTO` or `START` command. Existing calendar events are preserved while Winter Mode is on.
+
+## Using Winter Mode
+
+Update Automower Supervisor to **v0.6.0** in HACS and restart Home Assistant. Open **Settings → Devices & services → Automower Supervisor → the central Automower Supervisor device**. The new **WINTER MODE** switch and **Retry winter parking** button appear under configuration controls. Existing installations start with Winter Mode off; enable it explicitly when ready.
+
+Enable `WINTER MODE` (`switch.automower_supervisor_winter_mode`) on the central Supervisor device before putting the fleet away. The switch pauses Supervisor even when parking is incomplete; check the per-mower result attributes and use **Retry winter parking** (`button.automower_supervisor_retry_winter_parking`) after an offline mower becomes reachable. The retry button is available while Winter Mode is on and no parking pass is running. A completed docking service call does not verify physical arrival at the charging station. Stopped or faulted mowers may need on-site assistance: parking requests `HOME` only, without `START` or error reset.
+
+The parking request is the intended command while Winter Mode is enabled. Supervisor's normal wake-up, error-recovery, activity monitoring, and calendar workflows remain paused. Restarting Home Assistant restores the winter state; it does not resume mowing. Existing managed calendar events are not automatically deleted, so remove any obsolete winter appointment separately if needed.
+
+Winter Mode controls this integration. It does not disable unrelated Home Assistant automations, manual controls, or Robonect itself. A storage failure leaves Supervisor paused and exposes `storage_error`; no parking is started until the pause is saved. If storage could not be read, repair the storage problem and reload the integration before changing Winter Mode.
+
+In spring, turn Winter Mode off to resume Supervisor. Switching off itself sends no `AUTO`/`START` and does not restore the mowers' previous operating modes: parking sets Robonect to `HOME`. Set the robots back to `AUTO` and start them separately when they are ready for service. Once supervision resumes, its normal future scheduled routines may issue commands under their existing eligibility rules.
+
+## Spring roadmap: manual maneuvers and recovery
+
+Movement-based recovery is **not implemented in v0.6.0**. The profiles and observations below preserve the manual experiments for future development; they are not automatic recovery defaults or permission to drive through an active safety fault.
+
+### Recorded manual test profiles
+
+| User's profile | Left | Right | Timeout | Expected differential-drive motion |
+| --- | ---: | ---: | ---: | --- |
+| Back | -50 | -100 | 4000 ms | Reverse arc: rear moves toward the mower's left and nose turns right. |
+| Rotation | 80 | -100 | 2500 ms | Nose turns right with a backward component; unequal magnitudes do not describe a pure turn in place. |
+| Forward | 50 | 100 | 4000 ms | Forward arc with the nose turning left. |
+
+`left` and `right` are signed wheel-speed commands in percent; negative requests reverse, positive requests forward. `timeout` is milliseconds (4000 ms = 4 seconds). These geometries assume the documented sign convention and ideal traction. They do not specify a guaranteed distance or angle on grass. Retain the exact user-tested values above as experiment records, and calibrate any future profile for each mower/model before enabling it.
+
+Robonect already exposes timed wheel control through `robonect.direct`; its developer described a two-second, 50-percent forward command in the [API discussion](https://forum.robonect.de/viewtopic.php?p=5978#p5978). Device-side timeout behavior, STOP response, and interaction with faults still need verification on the installed firmware. The [Admin-reviewed browser joystick documentation](https://forum.robonect.de/viewtopic.php?t=3538) warns that bump/tilt sensors are disabled and that the joystick can operate outside the working area. It describes a motor-test mode without simultaneous blade operation; this does not establish identical behavior for `direct`.
+
+### Activity evidence, 19–29 September 2026
+
+The supplied `activity.csv` contains **34 rows with nonzero fault text**, grouped into the eight exact strings below. These are state-history rows, not necessarily 34 distinct physical incidents. The 87 `Fault 0` rows and four `unknown` rows are excluded from the fault counts.
+
+| Exact error string | Rows | Mower distribution | Future handling to investigate |
+| --- | ---: | --- | --- |
+| `Sbv14 has been lifted` | 12 | Sbv14: 12 | Active lift fault blocks movement; inspect the physical cause. |
+| `No traction` | 9 | Vv14 Big: 6; Vv14 Mini: 2; Vv2: 1 | Candidate for a separately validated traction-recovery policy after safety checks. |
+| `Charging station blocked` | 5 | Lv9: 3; Almv3: 1; Kv5: 1 | Separate docking/obstruction diagnosis; no generic escape command. |
+| `Battery empty` | 3 | Vv2: 2; Sbv14: 1 | Battery/charging intervention, not a driving-recovery trigger. |
+| `Outside working area` | 2 | Vv2: 2 | Boundary/location intervention; do not assume a safe drive direction. |
+| `Blade disc blocked` | 1 | Sbv14: 1 | Cutting-system inspection; no automatic movement or fault bypass. |
+| `Left wheel defect` | 1 | Sbv14: 1 | Drive-system inspection; no automatic movement or fault bypass. |
+| `Vv14Stora has been lifted` | 1 | Vv14 Big: 1 | Same active-lift block; preserve this distinct source string. |
+
+### Kv5 experiment, 30 September 2026
+
+The Kv5 case involved error code `15` (lifted). The user's approximate manual sequence was **RESET → START → DIRECT → HOME → AUTO**. The CSV records additional `AUTO`/`START` activity but does not contain the `DIRECT` wheel values or duration, so it cannot establish the exact executed maneuver sequence. It also shows the fault already clear at **12:32:55**, before the reset activity from **13:06 onward**. This is not evidence that driving cleared an active lift fault.
+
+The user reported an unsuccessful attempt followed by a retry and suspected Wi-Fi. That cause remains unproven: a missing response can also leave it unclear whether a movement command ran. Preserve this case as a manual observation, not a validated automatic recovery recipe.
+
+### Requirements before adding recovery
+
+- **Fault-specific eligibility**: Use an explicit allowlist of verified error codes, mower models, and current states. The broad `movement` category is not sufficient. Never clear or bypass an active lift, tilt, blade, wheel-defect, or other safety fault to enable motion; stale fault text and a current physical fault require different handling.
+- **Strict transport and STOP results**: Require confirmed command outcomes and fresh device state. Verify stop before and after movement, on cancellation, and after errors; validate the device's own timeout under connection loss. An HTTP/service completion alone does not prove the wheels stopped.
+- **Ambiguous requests**: Do not automatically resend a movement request after a timeout or missing acknowledgment; it may already have executed. Record an uncertain outcome and require reconciliation before another attempt.
+- **Shared command lock**: Coordinate maneuvers with existing wake-up/recovery flows. Reject expired or conflicting movement requests, and ensure STOP is not queued behind a long recovery sequence.
+- **Persistent attempt budget**: Save incident/day attempt limits and cooldowns before motion. Restarts must preserve the budget and must never resume an interrupted movement sequence.
+- **Separate outcome verification**: Record maneuver success separately from recovery. Exclude escape distance from mowing/recovery evidence, establish a fresh baseline after verified stop, and confirm normal work independently.
+
+Start with supervised manual operation and simulated-transport tests. Automatic recovery remains deferred until each permitted fault/profile combination and the installed mower firmware have been verified.
 
 ## Improvements in version 0.5.12
 
