@@ -12,6 +12,7 @@ import homeassistant.util.dt as dt_util
 
 from .activity import clear_pending_confirmation_fields
 from .schedule import get_daily_date
+from .winter_calendar import WinterCalendarMixin
 
 _LOGGER = logging.getLogger(__name__)
 WINTER_PARK_TIMEOUT_SECONDS = 15
@@ -37,10 +38,11 @@ def supervisor_operation(func):
     return guarded
 
 
-class WinterModeMixin:
-    """Global pause state; only explicit winter parking bypasses the pause."""
+class WinterModeMixin(WinterCalendarMixin):
+    """Global pause state with bounded winter parking and calendar cleanup."""
 
     def _init_winter_mode(self):
+        self._init_winter_calendar()
         self.winter_mode = False
         self.winter_mode_changed_at = None
         self.winter_parking_results = {}
@@ -52,7 +54,7 @@ class WinterModeMixin:
         self._supervisor_tasks = set()
         self._supervisor_generation = 0
         self._supervisor_unloading = False
-        self._winter_dock_tasks = set()
+        self._winter_request_tasks = set()
 
     def _supervisor_running(self):
         generation = _operation_generation.get()
@@ -86,6 +88,7 @@ class WinterModeMixin:
             "changed_at": self.winter_mode_changed_at,
             "resume_date": self._winter_resume_date,
             "parking_results": {key: dict(value) for key, value in self.winter_parking_results.items()},
+            "calendar_cleanup": dict(self.winter_calendar_cleanup),
         }
 
     def _load_winter_state(self, data):
@@ -116,7 +119,7 @@ class WinterModeMixin:
             self.winter_mode_changed_at = changed_at
             self._winter_resume_date = resume_date
             self.winter_parking_results = {key: dict(value) for key, value in results.items()}
-            changed = False
+            changed = self._load_winter_calendar(winter)
             for result in self.winter_parking_results.values():
                 if result["status"] in {"pending", "requesting"}:
                     result["status"] = "unverified"
@@ -136,8 +139,10 @@ class WinterModeMixin:
             tasks.update(getattr(self, name, {}).values())
         tasks.add(getattr(self, "_morning_wakeup_task", None))
         if include_parking:
+            self._cancel_winter_calendar_startup()
             tasks.add(self._winter_parking_task)
-            tasks.update(self._winter_dock_tasks)
+            tasks.add(self._winter_calendar_task)
+            tasks.update(self._winter_request_tasks)
         tasks = {task for task in tasks if task is not None and task is not current and not task.done()}
         for task in tasks:
             task.cancel()
@@ -151,6 +156,8 @@ class WinterModeMixin:
                     result["status"] = "unverified"
                     result["error"] = "Parking interrupted; explicit retry required"
             self.winter_parking_in_progress = False
+        if include_parking:
+            self.winter_calendar_cleanup_in_progress = False
 
     async def _async_save_winter(self):
         try:
@@ -168,6 +175,8 @@ class WinterModeMixin:
             if enabled == self.winter_mode:
                 if enabled and self.winter_storage_error:
                     await self._async_save_winter()
+                if enabled:
+                    self._schedule_winter_calendar_cleanup()
                 return
             self._supervisor_generation += 1
             if enabled:
@@ -175,6 +184,7 @@ class WinterModeMixin:
                 self.winter_mode_changed_at = dt_util.as_utc(dt_util.now()).isoformat()
                 self.setup_calendar_timers()
                 self._prepare_winter_parking()
+                self._prepare_winter_calendar()
                 self._notify_callbacks()
                 try:
                     # Commit ON before waiting for cancellation or issuing HOME.
@@ -182,6 +192,7 @@ class WinterModeMixin:
                 finally:
                     await self._async_cancel_supervisor_work()
                 self._start_winter_parking()
+                self._schedule_winter_calendar_cleanup()
             else:
                 # Remain paused until the OFF value is durably saved.
                 await self._async_cancel_supervisor_work()
@@ -243,14 +254,20 @@ class WinterModeMixin:
             self._start_winter_parking()
 
     async def _async_bounded_winter_dock(self, entity_id):
+        return await self._async_bounded_winter_call(
+            self.hass.services.async_call(
+                "lawn_mower", "dock", {"entity_id": entity_id}, blocking=True
+            ),
+            "Docking request timed out; physical state unverified",
+        )
+
+    async def _async_bounded_winter_call(self, coroutine, timeout_error):
         """Bound our wait even if an integration suppresses task cancellation."""
-        task = self.hass.async_create_task(self.hass.services.async_call(
-            "lawn_mower", "dock", {"entity_id": entity_id}, blocking=True
-        ))
-        self._winter_dock_tasks.add(task)
+        task = self.hass.async_create_task(coroutine)
+        self._winter_request_tasks.add(task)
 
         def finished(done):
-            self._winter_dock_tasks.discard(done)
+            self._winter_request_tasks.discard(done)
             if not done.cancelled():
                 done.exception()  # Retrieve errors if a timed-out call finishes later.
 
@@ -258,7 +275,7 @@ class WinterModeMixin:
         try:
             done, _ = await asyncio.wait({task}, timeout=WINTER_PARK_TIMEOUT_SECONDS)
             if not done:
-                raise TimeoutError("Docking request timed out; physical state unverified")
+                raise TimeoutError(timeout_error)
             return task.result()
         finally:
             if not task.done():

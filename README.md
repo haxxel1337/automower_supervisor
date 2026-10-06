@@ -1,6 +1,12 @@
-# Automower Supervisor v0.6.0
+# Automower Supervisor v0.6.1
 
 Automower Supervisor is a local Home Assistant custom integration that aggregates and monitors Husqvarna Automower / Robonect installations. It tracks the health and errors of 11 specific robotic lawn mowers, ensuring that any real errors detected are persistently stored and tracked until verified.
+
+## Improvements in version 0.6.1
+
+- **Winter calendar cleanup**: Turning Winter Mode on removes Supervisor-marked appointments in the current service window and any cached snapshot date. Other appointments are preserved.
+- **Upgrade while already paused**: An installation already in Winter Mode runs the cleanup after Home Assistant has started, without repeating HOME or sending any mower command.
+- **Visible cleanup result**: The switch and Summary sensor expose the cleanup status, deleted count, and errors. Use **Retry winter calendar cleanup** if the calendar was unavailable. Winter Mode remains on when cleanup fails.
 
 ## Improvements in version 0.6.0
 
@@ -12,11 +18,13 @@ Automower Supervisor is a local Home Assistant custom integration that aggregate
 
 ## Using Winter Mode
 
-Update Automower Supervisor to **v0.6.0** in HACS and restart Home Assistant. Open **Settings → Devices & services → Automower Supervisor → the central Automower Supervisor device**. The new **WINTER MODE** switch and **Retry winter parking** button appear under configuration controls. Existing installations start with Winter Mode off; enable it explicitly when ready.
+Update Automower Supervisor to **v0.6.1** in HACS and restart Home Assistant. Open **Settings → Devices & services → Automower Supervisor → the central Automower Supervisor device**. **WINTER MODE**, **Retry winter parking**, and **Retry winter calendar cleanup** appear under configuration controls. Existing installations start with Winter Mode off unless it was already enabled; enable it explicitly when ready.
 
 Enable `WINTER MODE` (`switch.automower_supervisor_winter_mode`) on the central Supervisor device before putting the fleet away. The switch pauses Supervisor even when parking is incomplete; check the per-mower result attributes and use **Retry winter parking** (`button.automower_supervisor_retry_winter_parking`) after an offline mower becomes reachable. The retry button is available while Winter Mode is on and no parking pass is running. A completed docking service call does not verify physical arrival at the charging station. Stopped or faulted mowers may need on-site assistance: parking requests `HOME` only, without `START` or error reset.
 
-The parking request is the intended command while Winter Mode is enabled. Supervisor's normal wake-up, error-recovery, activity monitoring, and calendar workflows remain paused. Restarting Home Assistant restores the winter state; it does not resume mowing. Existing managed calendar events are not automatically deleted, so remove any obsolete winter appointment separately if needed.
+Parking and removal of Supervisor-marked appointments are the intended actions while Winter Mode is enabled. Supervisor's normal wake-up, error-recovery, activity monitoring, and calendar creation workflows remain paused. Restarting Home Assistant restores the winter state; it does not resume mowing. Cleanup uses the exact `[AUTOMOWER_SUPERVISOR:v1:YYYY-MM-DD]` description marker, not the event title. It checks yesterday through the next seven days plus cached event/snapshot dates, preserves unmarked or recurring appointments, and reports an error if deletion is unsupported or an owned event has no UID. A calendar retry does not send mower commands.
+
+If you already enabled Winter Mode in v0.6.0 and disabled Supervisor, temporarily re-enable **Supervisor** after updating to v0.6.1 so it can perform calendar cleanup. **Robonect can remain disabled** for this cleanup. Verify `calendar_cleanup.status` is `deleted` or `no_events` before disabling Supervisor for winter; a disabled integration cannot perform cleanup.
 
 Winter Mode controls this integration. It does not disable unrelated Home Assistant automations, manual controls, or Robonect itself. A storage failure leaves Supervisor paused and exposes `storage_error`; no parking is started until the pause is saved. If storage could not be read, repair the storage problem and reload the integration before changing Winter Mode.
 

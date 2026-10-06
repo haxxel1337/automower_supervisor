@@ -106,6 +106,7 @@ homeassistant.const.Platform = MagicMock()
 homeassistant.const.Platform.SENSOR = "sensor"
 homeassistant.const.Platform.SWITCH = "switch"
 homeassistant.const.Platform.BUTTON = "button"
+homeassistant.const.EVENT_HOMEASSISTANT_STARTED = "homeassistant_started"
 
 
 class MockHomeAssistantError(Exception):
