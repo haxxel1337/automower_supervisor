@@ -13,7 +13,7 @@ from .manager import AutomowerSupervisorManager
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.SWITCH, Platform.BUTTON]
 
 # Type annotation helper for config entries
 # In Python <3.12 we can just annotate directly as ConfigEntry[AutomowerSupervisorManager]
@@ -33,7 +33,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry[AutomowerSup
     # Store manager in runtime_data
     entry.runtime_data = manager
 
-    # Forward setup to the sensor platform
+    # Forward setup to sensors and the central winter controls.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Register options update listener to reload on options change
@@ -51,7 +51,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry[AutomowerSu
     """Unload Automower Supervisor config entry."""
     _LOGGER.info("Unloading Automower Supervisor entry: %s", entry.entry_id)
 
-    # Unload sensor platforms
+    # Unload entity platforms.
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:

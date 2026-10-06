@@ -505,6 +505,8 @@ async def async_fetch_managed_event(
     hass: HomeAssistant,
     calendar_entity_id: str,
     date_str: str,
+    *,
+    command_guard=None,
 ) -> dict | None:
     """Search for an existing managed event in the narrow window of target date."""
     try:
@@ -525,7 +527,11 @@ async def async_fetch_managed_event(
             return None
 
         # Query events using entity async_get_events
+        if command_guard:
+            command_guard()
         events = await entity.async_get_events(hass, dt_start, dt_end)
+        if command_guard:
+            command_guard()
         if not events:
             return None
 
@@ -550,10 +556,14 @@ async def async_fetch_managed_event(
             # Keep the first one, delete the rest
             for extra_event in matched_events[1:]:
                 if extra_event.uid:
+                    if command_guard:
+                        command_guard()
                     try:
                         await entity.async_delete_event(extra_event.uid)
                     except Exception as err:
                         _LOGGER.error("Failed to delete duplicate calendar event: %s", err)
+                    if command_guard:
+                        command_guard()
 
         event_match = matched_events[0]
         return {

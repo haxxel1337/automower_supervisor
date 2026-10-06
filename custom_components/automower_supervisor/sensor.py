@@ -97,6 +97,8 @@ class AutomowerRobotSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         """Return the state of the sensor."""
+        if self.manager.winter_mode:
+            return "winter_mode"
         state_data = self.manager.robots[self.robot_id]
         now = dt_util.now()
         attempt_is_today = is_attempt_from_today(state_data, now)
@@ -327,6 +329,8 @@ class AutomowerRobotSensor(SensorEntity):
                 unique_reasons.append(r)
 
         source_values_stale = (
+            self.manager.winter_mode
+            or
             state_data.online is False
             or state_data.online is None
             or (state_data.source_age_minutes is not None and state_data.source_age_minutes > 15)
@@ -334,6 +338,8 @@ class AutomowerRobotSensor(SensorEntity):
         )
 
         return {
+            "winter_mode": self.manager.winter_mode,
+            "supervision_paused": self.manager.winter_mode,
             "robot_id": self.robot_id,
             "display_name": state_data.display_name,
             "current_status": state_data.current_status,
@@ -351,7 +357,7 @@ class AutomowerRobotSensor(SensorEntity):
             "unknown_entities": state_data.unknown_entities,
             "last_event_at": state_data.last_event_at,
             "entity_ids": state_data.entity_ids,
-            "assessment_reasons": unique_reasons,
+            "assessment_reasons": ["WINTER_MODE"] if self.manager.winter_mode else unique_reasons,
             "online": state_data.online,
             "last_source_update_at": state_data.last_source_update_at,
             "source_age_minutes": state_data.source_age_minutes,
@@ -361,7 +367,7 @@ class AutomowerRobotSensor(SensorEntity):
             "watchdog_checked_at": self.manager.watchdog_checked_at,
             "source_values_stale": source_values_stale,
             # Schedule properties
-            "scheduled_now": is_scheduled_now(now),
+            "scheduled_now": not self.manager.winter_mode and is_scheduled_now(now),
             "schedule_start": 11,
             "schedule_end": 18,
             "schedule_timezone": "Europe/Stockholm",
@@ -431,12 +437,12 @@ class AutomowerRobotSensor(SensorEntity):
             "charging_stalled": state_data.charging_stalled,
             "charging_stalled_at": state_data.charging_stalled_at,
             # Daily attention
-            "daily_attention_required": state_data.daily_attention_required,
-            "daily_attention_state": state_data.daily_attention_state,
-            "daily_attention_reason_codes": state_data.daily_attention_reason_codes,
-            "daily_attention_text": state_data.daily_attention_text,
+            "daily_attention_required": False if self.manager.winter_mode else state_data.daily_attention_required,
+            "daily_attention_state": "winter_mode" if self.manager.winter_mode else state_data.daily_attention_state,
+            "daily_attention_reason_codes": ["WINTER_MODE"] if self.manager.winter_mode else state_data.daily_attention_reason_codes,
+            "daily_attention_text": "Supervisor paused for winter." if self.manager.winter_mode else state_data.daily_attention_text,
             "daily_attention_evaluated_at": state_data.daily_attention_evaluated_at,
-            "daily_check_started": self._get_daily_check_started(now),
+            "daily_check_started": not self.manager.winter_mode and self._get_daily_check_started(now),
             "daily_schedule_finished": self._get_daily_schedule_finished(now),
             "daily_observation_complete": self.manager.daily_observation_complete,
         }
@@ -573,7 +579,7 @@ class AutomowerDiscoverySensor(SensorEntity):
                 "source_age_minutes": state_data.source_age_minutes,
                 "last_source_update_at": state_data.last_source_update_at,
                 # v0.3.0 fields per robot
-                "scheduled_now": is_scheduled_now(dt_util.now()),
+                "scheduled_now": not self.manager.winter_mode and is_scheduled_now(dt_util.now()),
                 "mowing_session_active": state_data.mowing_session_active,
                 "confirmed_mowing_today": state_data.confirmed_mowing_today,
                 "failed_recovery": state_data.failed_recovery,
@@ -588,6 +594,8 @@ class AutomowerDiscoverySensor(SensorEntity):
         daily_schedule_finished_val = daily_schedule_finished(dt_util.now())
 
         return {
+            "winter_mode": self.manager.winter_mode,
+            "supervision_paused": self.manager.winter_mode,
             "robots_configured": len(self.manager.robots),
             "robots_found": self.native_value,
             "entities_expected": total_expected,
@@ -606,11 +614,11 @@ class AutomowerDiscoverySensor(SensorEntity):
             "robots_with_failed_recovery": robots_with_failed_recovery,
             "robots_with_pending_confirmation": robots_with_pending_confirmation,
             # v0.4.0 metrics
-            "robots_needing_attention": robots_needing_attention,
-            "robots_monitoring": robots_monitoring,
-            "attention_robot_names": attention_robot_names,
-            "monitoring_robot_names": monitoring_robot_names,
-            "daily_check_started": daily_check_started_val,
+            "robots_needing_attention": 0 if self.manager.winter_mode else robots_needing_attention,
+            "robots_monitoring": 0 if self.manager.winter_mode else robots_monitoring,
+            "attention_robot_names": [] if self.manager.winter_mode else attention_robot_names,
+            "monitoring_robot_names": [] if self.manager.winter_mode else monitoring_robot_names,
+            "daily_check_started": not self.manager.winter_mode and daily_check_started_val,
             "daily_schedule_finished": daily_schedule_finished_val,
             "last_daily_evaluation_at": self.manager.daily_attention_summary.get("last_evaluated_at"),
             "robots": robots_dict,
@@ -644,8 +652,10 @@ class AutomowerSupervisorSummarySensor(SensorEntity):
         )
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> int | str:
         """Return the number of robots needing attention."""
+        if self.manager.winter_mode:
+            return "winter_mode"
         summary = self.manager.daily_attention_summary
         return summary.get("attention_count", 0)
 
@@ -653,9 +663,30 @@ class AutomowerSupervisorSummarySensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return details about daily attention states and calendar sync."""
         attrs = dict(self.manager.daily_attention_summary)
+        if self.manager.winter_mode:
+            attrs.update(
+                attention_count=0,
+                robot_ids=[],
+                robot_names=[],
+                event_title=None,
+                summary_text="Supervisor paused for winter.",
+                details=[],
+                schedule_check_started=False,
+                monitoring_names=[],
+                monitoring_count=0,
+            )
+        attrs["winter_mode"] = self.manager.winter_mode
+        attrs["supervision_paused"] = self.manager.winter_mode
+        attrs["winter_mode_changed_at"] = self.manager.winter_mode_changed_at
+        attrs["winter_parking_in_progress"] = self.manager.winter_parking_in_progress
+        attrs["winter_parking_results"] = {
+            robot_id: dict(result)
+            for robot_id, result in self.manager.winter_parking_results.items()
+        }
+        attrs["winter_storage_error"] = self.manager.winter_storage_error
         
         # Add calendar sync attributes
-        attrs["calendar_sync_enabled"] = self.manager.calendar_enabled
+        attrs["calendar_sync_enabled"] = self.manager.calendar_enabled and not self.manager.winter_mode
         attrs["calendar_entity_id"] = self.manager.calendar_entity_id
         attrs["last_evening_sync_at"] = self.manager.last_evening_sync_at
         attrs["last_morning_sync_at"] = self.manager.last_morning_sync_at

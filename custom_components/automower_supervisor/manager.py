@@ -41,6 +41,7 @@ from .const import (
 )
 from .models import RobotState, RecoveryState
 from .storage import AutomowerSupervisorStorage
+from .winter import WinterModeMixin, supervisor_operation
 from .error_classifier import classify_error
 from .schedule import get_daily_date
 from .charging import update_charging_monitor
@@ -133,13 +134,14 @@ def _update_entity_state_lists(state: RobotState, entity_id: str, target_list_na
         state.unknown_entities.append(entity_id)
 
 
-class AutomowerSupervisorManager:
+class AutomowerSupervisorManager(WinterModeMixin):
     """Manages tracking and evaluating the state of all configured Automowers."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the manager."""
         self.hass = hass
         self._storage = AutomowerSupervisorStorage(hass)
+        self._init_winter_mode()
         self._callbacks: list[Callable[[], None]] = []
         self._unsub_listener: Callable[[], None] | None = None
         self._unsub_watchdog: Callable[[], None] | None = None
@@ -193,6 +195,17 @@ class AutomowerSupervisorManager:
         
         # Load from disk
         storage_changed = await self._async_load_storage()
+
+        if self.winter_mode:
+            # Load the durable pause before any assessment or catch-up command.
+            self.setup_listeners()
+            self._unsub_watchdog = async_track_time_interval(
+                self.hass, self._async_watchdog_check, timedelta(minutes=5)
+            )
+            self.register_services()
+            if storage_changed:
+                await self._storage.async_save(self.get_storage_data())
+            return
         
         # Initial scan of current state machine states
         if self.sync_initial_states(is_startup=True):
@@ -248,7 +261,19 @@ class AutomowerSupervisorManager:
         for state in self.robots.values():
             state.daily_date = current_date
 
-        stored_data = await self._storage.async_load()
+        try:
+            stored_data = await self._storage.async_load_strict()
+        except Exception as err:
+            self.winter_mode = True
+            self.winter_storage_error = f"Cannot read Supervisor storage: {err}"
+            _LOGGER.error(self.winter_storage_error)
+            return False
+        storage_changed = self._load_winter_state(stored_data)
+        if stored_data is not None and not isinstance(stored_data, dict):
+            self._storage._load_failed = True
+            self.winter_mode = True
+            self.winter_storage_error = "Supervisor storage is not an object"
+            return False
         if not stored_data:
             _LOGGER.debug("No persistent storage data found")
             return False
@@ -448,10 +473,13 @@ class AutomowerSupervisorManager:
             "last_calendar_sync_result": self.last_calendar_sync_result,
             "last_calendar_sync_error": self.last_calendar_sync_error,
         }
+        data["_winter"] = self._winter_storage_data()
         return data
 
     def sync_initial_states(self, is_startup: bool = False) -> bool:
         """Sync initial states of entities from Home Assistant."""
+        if not self._supervisor_running():
+            return False
         now = dt_util.now()
         current_time_iso = now.isoformat()
         storage_changed = False
@@ -535,6 +563,7 @@ class AutomowerSupervisorManager:
             self._async_state_changed_event
         )
 
+    @supervisor_operation
     async def _async_state_changed_event(self, event: Event) -> None:
         """Handle state change event."""
         entity_id = event.data.get("entity_id")
@@ -754,14 +783,15 @@ class AutomowerSupervisorManager:
         )
 
     async def _async_press_robonect_button(self, entity_id: str) -> None:
-        """Queue a Robonect button press without blocking on its REST request."""
+        """Await a command so winter mode can cancel the owning sequence."""
+        self._ensure_supervisor_running()
         if not self._button_available(entity_id):
             raise RuntimeError(f"Button unavailable: {entity_id}")
         await self.hass.services.async_call(
             "button",
             "press",
             {"entity_id": entity_id},
-            blocking=False,
+            blocking=True,
         )
 
     @staticmethod
@@ -774,6 +804,8 @@ class AutomowerSupervisorManager:
 
     def _targeted_wakeup_eligible(self, state: RobotState, local_date: str) -> bool:
         """Return whether one robot may receive the 09:00 wake-up sequence."""
+        if not self._supervisor_running() or self._winter_resume_date == local_date:
+            return False
         if state.morning_wakeup_attempted_date == local_date:
             return False
         if state.online is not True:
@@ -786,6 +818,7 @@ class AutomowerSupervisorManager:
             return False
         return self._resting_status(state)
 
+    @supervisor_operation
     async def _async_run_targeted_morning_wakeup(
         self,
         now: datetime | None = None,
@@ -842,6 +875,8 @@ class AutomowerSupervisorManager:
 
     def _latched_error_reset_eligible(self, state: RobotState, now: datetime) -> bool:
         """Return True only for stale error text while already mowing."""
+        if not self._supervisor_running() or self._winter_skip_catchup(now):
+            return False
         if state.auto_reset_in_progress:
             return False
         if state.current_error_active is not True:
@@ -877,6 +912,7 @@ class AutomowerSupervisorManager:
 
         return age >= AUTO_RESET_LATCH_MINUTES * 60
 
+    @supervisor_operation
     async def _async_run_latched_error_reset(self, robot_id: str, now: datetime) -> None:
         """Run STOP -> RESET -> START -> AUTO for one eligible mower."""
         state = self.robots[robot_id]
@@ -954,6 +990,8 @@ class AutomowerSupervisorManager:
         return start <= minutes < start + LATE_START_WINDOW_MINUTES
 
     def _late_start_kick_eligible(self, state: RobotState, now: datetime) -> bool:
+        if not self._supervisor_running() or self._winter_skip_catchup(now):
+            return False
         # Return whether a robot should receive AUTO -> START after schedule start.
         if not self._late_start_check_window_active(now):
             return False
@@ -982,6 +1020,7 @@ class AutomowerSupervisorManager:
             return False
         return self._resting_status(state)
 
+    @supervisor_operation
     async def _async_run_late_start_kick(self, robot_id: str, now: datetime) -> None:
         # Send AUTO then START to one healthy resting robot after schedule start.
         state = self.robots[robot_id]
@@ -1039,8 +1078,11 @@ class AutomowerSupervisorManager:
         self._late_start_tasks[robot_id] = task
         return True
 
+    @supervisor_operation
     async def _async_service_window_reconciliation_tick(self, now: datetime) -> None:
         """Reconcile calendar every five minutes from 11:20 through 12:15."""
+        if self._winter_skip_catchup(now):
+            return
         from .calendar_sync import get_stockholm_timezone, is_service_day
 
         local_now = now.astimezone(get_stockholm_timezone())
@@ -1072,6 +1114,9 @@ class AutomowerSupervisorManager:
 
     async def async_unload(self) -> None:
         """Unload entry, clear listeners and save immediately."""
+        self._supervisor_unloading = True
+        self._supervisor_generation += 1
+        await self._async_cancel_supervisor_work()
         _LOGGER.debug("Unloading Automower Supervisor manager")
         if self._unsub_listener:
             try:
@@ -1124,6 +1169,8 @@ class AutomowerSupervisorManager:
 
     def _update_watchdog_for_robot(self, robot_id: str, now: datetime) -> None:
         """Calculate and update state age/online watchdog metrics for a single robot."""
+        if not self._supervisor_running():
+            return
         state = self.robots[robot_id]
         
         HEARTBEAT_KEYS = [
@@ -1242,6 +1289,7 @@ class AutomowerSupervisorManager:
             state.mower_data_age_minutes = None
             state.mower_data_stale = True
 
+    @supervisor_operation
     async def _async_watchdog_check(self, now: datetime) -> None:
         """Run periodic watchdog evaluation for all robots."""
         _LOGGER.debug("Running periodic watchdog check")
@@ -1299,6 +1347,8 @@ class AutomowerSupervisorManager:
 
     def evaluate_all_daily_attention(self, now: datetime) -> None:
         """Evaluate daily attention states for all robots and rebuild the summary."""
+        if not self._supervisor_running():
+            return
         # Calculate daily observation complete flag
         local_date = get_daily_date(now)
         
@@ -1470,7 +1520,7 @@ class AutomowerSupervisorManager:
                 pass
         self._unsub_calendar_timers.clear()
 
-        if not self.calendar_enabled:
+        if not self.calendar_enabled or not self._supervisor_running():
             _LOGGER.info("Calendar sync is disabled by configuration")
             return
 
@@ -1485,8 +1535,11 @@ class AutomowerSupervisorManager:
             mo_h, mo_m = 11, 20
 
         from homeassistant.helpers.event import async_track_time_change
+        timer_generation = self._supervisor_generation
 
         async def evening_timer_callback(_datetime):
+            if timer_generation != self._supervisor_generation:
+                return
             _LOGGER.info("Evening calendar sync triggered at %s", _datetime)
             await self.async_run_evening_calendar_sync(dt_util.now())
 
@@ -1500,6 +1553,8 @@ class AutomowerSupervisorManager:
         self._unsub_calendar_timers.append(unsub_ev)
 
         async def morning_timer_callback(_datetime):
+            if timer_generation != self._supervisor_generation:
+                return
             _LOGGER.info("Morning calendar sync triggered at %s", _datetime)
             await self.async_run_morning_calendar_sync(dt_util.now())
 
@@ -1513,6 +1568,8 @@ class AutomowerSupervisorManager:
         self._unsub_calendar_timers.append(unsub_mo)
 
         async def targeted_wakeup_callback(_datetime):
+            if timer_generation != self._supervisor_generation or not self._supervisor_running():
+                return
             if self._morning_wakeup_task is None or self._morning_wakeup_task.done():
                 self._morning_wakeup_task = self.hass.async_create_task(
                     self._async_run_targeted_morning_wakeup(dt_util.now())
@@ -1528,6 +1585,8 @@ class AutomowerSupervisorManager:
         self._unsub_calendar_timers.append(unsub_wakeup)
 
         async def reconciliation_interval_callback(_datetime):
+            if timer_generation != self._supervisor_generation:
+                return
             await self._async_service_window_reconciliation_tick(dt_util.now())
 
         unsub_reconcile = async_track_time_interval(
@@ -1544,8 +1603,11 @@ class AutomowerSupervisorManager:
             TARGETED_WAKEUP_HOUR, TARGETED_WAKEUP_MINUTE,
         )
 
+    @supervisor_operation
     async def async_check_missed_syncs(self) -> None:
         """Check if any scheduled syncs were missed during downtime and execute them."""
+        if self._winter_skip_catchup(dt_util.now()):
+            return
         if not self.calendar_enabled:
             return
 
@@ -1630,6 +1692,7 @@ class AutomowerSupervisorManager:
         except (TypeError, ValueError):
             return 12, 20
 
+    @supervisor_operation
     async def _async_upsert_managed_calendar_event(
         self,
         *,
@@ -1670,6 +1733,7 @@ class AutomowerSupervisorManager:
                 )
 
             if supported_features & CalendarEntityFeature.UPDATE_EVENT:
+                self._ensure_supervisor_running()
                 await entity.async_update_event(event_uid, event_payload)
                 return "updated"
 
@@ -1684,6 +1748,7 @@ class AutomowerSupervisorManager:
                 )
 
             # Create first. Delete the old event only after creation succeeds.
+            self._ensure_supervisor_running()
             await self.hass.services.async_call(
                 "calendar",
                 "create_event",
@@ -1696,6 +1761,7 @@ class AutomowerSupervisorManager:
                 },
                 blocking=True,
             )
+            self._ensure_supervisor_running()
             await entity.async_delete_event(event_uid)
             return "replaced_safely"
 
@@ -1704,6 +1770,7 @@ class AutomowerSupervisorManager:
                 f"Calendar entity {entity_id} does not support event creation"
             )
 
+        self._ensure_supervisor_running()
         await self.hass.services.async_call(
             "calendar",
             "create_event",
@@ -1718,6 +1785,7 @@ class AutomowerSupervisorManager:
         )
         return "created"
 
+    @supervisor_operation
     async def _async_delete_managed_event(
         self,
         entity_id: str,
@@ -1755,9 +1823,11 @@ class AutomowerSupervisorManager:
                 "it was preserved"
             )
 
+        self._ensure_supervisor_running()
         await entity.async_delete_event(event_uid)
         return "deleted"
 
+    @supervisor_operation
     async def async_run_evening_calendar_sync(self, now: datetime) -> str:
         """Run evening sync and maintain one worklist for the next service day."""
         if not self.calendar_enabled:
@@ -1859,6 +1929,7 @@ class AutomowerSupervisorManager:
                     self.hass,
                     entity_id,
                     target_date_str,
+                    command_guard=self._ensure_supervisor_running,
                 )
 
                 from .const import ROBOTS
@@ -1919,6 +1990,7 @@ class AutomowerSupervisorManager:
                         self.hass,
                         entity_id,
                         target_date_str,
+                        command_guard=self._ensure_supervisor_running,
                     )
                     self.event_cache = {
                         "date": target_date_str,
@@ -1955,6 +2027,7 @@ class AutomowerSupervisorManager:
                 self._notify_callbacks()
                 return "error"
 
+    @supervisor_operation
     async def async_run_morning_calendar_sync(self, now: datetime) -> str:
         """Reconcile the service-window snapshot every morning at configured time."""
         if not self.calendar_enabled:
@@ -2172,6 +2245,7 @@ class AutomowerSupervisorManager:
                     self.hass,
                     entity_id,
                     current_date_str,
+                    command_guard=self._ensure_supervisor_running,
                 )
 
                 start_h, start_m = self._parse_calendar_event_start_time()
@@ -2210,6 +2284,7 @@ class AutomowerSupervisorManager:
                         self.hass,
                         entity_id,
                         current_date_str,
+                        command_guard=self._ensure_supervisor_running,
                     )
                     self.event_cache = {
                         "date": current_date_str,
@@ -2269,7 +2344,7 @@ class AutomowerSupervisorManager:
         self.hass.services.async_register(
             DOMAIN,
             "sync_calendar",
-            sync_calendar_service,
+            self._guarded_supervisor_service(sync_calendar_service),
         )
 
         async def delete_managed_calendar_event_service(call):
@@ -2319,6 +2394,7 @@ class AutomowerSupervisorManager:
                     self.hass,
                     entity_id,
                     date_str,
+                    command_guard=self._ensure_supervisor_running,
                 )
                 if not existing_event:
                     continue
@@ -2327,6 +2403,7 @@ class AutomowerSupervisorManager:
                 if not event_uid or event_uid in deleted_uids:
                     continue
 
+                self._ensure_supervisor_running()
                 await entity.async_delete_event(event_uid)
                 deleted_uids.add(event_uid)
 
@@ -2338,5 +2415,5 @@ class AutomowerSupervisorManager:
         self.hass.services.async_register(
             DOMAIN,
             "delete_managed_calendar_event",
-            delete_managed_calendar_event_service,
+            self._guarded_supervisor_service(delete_managed_calendar_event_service),
         )
